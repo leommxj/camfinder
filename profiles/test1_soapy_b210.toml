@@ -1,0 +1,35 @@
+name = "test1_soapy_b210"
+freqs_mhz = [756.0, 783.0, 810.0, 837.0, 891.0, 918.0, 972.0]
+offset_model = "ppm"
+min_hits = 4
+min_score = 20.0
+max_offset_spread_hz = 1200.0
+
+[scan]
+peak_search_window_hz = 250000.0
+min_peak_snr_db = 6.0
+max_peaks_per_freq = 20
+record_spectrum_bins = 128
+record_band_decimation = 1
+output = "tui"
+
+[device]
+backend = "soapy"
+
+[device.soapy]
+device_args = "driver=uhd,type=b200"
+device_index = 0
+channel = 0
+sample_rate_hz = 3000000
+dwell_ms = 350
+fft_size = 65536
+dc_notch_hz = 2000.0
+settle_ms = 80
+bandwidth_hz = 3000000.0
+# Set this if needed for your cabling:
+antenna = "RX2"
+# antenna = "TX/RX"
+
+[device.soapy.gain]
+mode = "manual"
+gain_db = 40.0

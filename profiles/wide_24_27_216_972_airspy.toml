@@ -1,0 +1,43 @@
+name = "wide_24_27_216_972_airspy"
+freqs_mhz = [
+    216.0, 240.0, 243.0, 264.0, 270.0, 288.0, 297.0, 312.0,
+    324.0, 336.0, 351.0, 360.0, 378.0, 384.0, 405.0, 408.0,
+    432.0, 456.0, 459.0, 480.0, 486.0, 504.0, 513.0, 528.0,
+    540.0, 552.0, 567.0, 576.0, 594.0, 600.0, 621.0, 624.0,
+    648.0, 672.0, 675.0, 696.0, 702.0, 720.0, 729.0, 744.0,
+    756.0, 768.0, 783.0, 792.0, 810.0, 816.0, 837.0, 840.0,
+    864.0, 888.0, 891.0, 912.0, 918.0, 936.0, 945.0, 960.0,
+    972.0,
+]
+offset_model = "ppm"
+min_hits = 99
+min_score = 20.0
+max_offset_spread_hz = 1200.0
+
+[scan]
+peak_search_window_hz = 250000.0
+min_peak_snr_db = 6.0
+max_peaks_per_freq = 12
+record_spectrum_bins = 128
+record_band_decimation = 1
+output = "table"
+
+[device]
+backend = "airspy"
+
+[device.airspy]
+device_index = 0
+sample_rate_hz = 3000000
+dwell_ms = 150
+fft_size = 65536
+dc_notch_hz = 2000.0
+settle_ms = 40
+
+[device.airspy.gain]
+mode = "manual"
+preset = 18
+lna = 15
+mixer = 15
+vga = 2
+lna_agc = false
+mixer_agc = false

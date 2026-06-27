@@ -1,0 +1,34 @@
+name = "test2"
+freqs_mhz = [768.0, 792.0, 816.0, 840.0, 864.0, 888.0, 912.0]
+offset_model = "ppm"
+min_hits = 4
+min_score = 20.0
+max_offset_spread_hz = 1200.0
+
+[scan]
+peak_search_window_hz = 250000.0
+min_peak_snr_db = 6.0
+max_peaks_per_freq = 20
+record_spectrum_bins = 128
+record_band_decimation = 1
+output = "tui"
+
+[device]
+backend = "airspy"
+
+[device.airspy]
+device_index = 0
+sample_rate_hz = 3000000
+dwell_ms = 350
+fft_size = 65536
+dc_notch_hz = 2000.0
+settle_ms = 40
+
+[device.airspy.gain]
+mode = "manual"
+preset = 18
+lna = 15
+mixer = 15
+vga = 2
+lna_agc = false
+mixer_agc = false

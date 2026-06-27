@@ -1,0 +1,71 @@
+profile_files = [
+  "profiles",
+]
+
+[profile_defaults]
+min_hits = 2
+min_score = 8.0
+max_offset_spread_hz = 1200.0
+
+[scan]
+peak_search_window_hz = 250000.0
+min_peak_snr_db = 4.0
+max_peaks_per_freq = 16
+record_spectrum_bins = 128
+record_band_decimation = 1
+output = "tui"
+
+# Future dynamic masks can be persisted here. Width is full bandwidth.
+#[[masks]]
+#center_hz = 864012500.0
+#width_hz = 50000.0
+#label = "known local interferer"
+
+[device]
+backend = "airspy"
+
+[device.peaks_file]
+# path = "peaks.json"
+
+[device.airspy]
+device_index = 0
+sample_rate_hz = 3000000
+dwell_ms = 350
+fft_size = 65536
+dc_notch_hz = 2000.0
+settle_ms = 40
+
+[device.airspy.gain]
+mode = "manual"
+preset = 18
+lna = 11
+mixer = 9
+vga = 12
+lna_agc = false
+mixer_agc = false
+
+# Build with `cargo build --features soapy` to use this backend.
+# Example device_args values:
+#   RTL-SDR:  "driver=rtlsdr"
+#   HackRF:   "driver=hackrf"
+#   USRP B210:"driver=uhd"
+[device.soapy]
+device_args = "driver=rtlsdr"
+device_index = 0
+channel = 0
+sample_rate_hz = 2400000
+dwell_ms = 750
+fft_size = 65536
+dc_notch_hz = 2000.0
+settle_ms = 80
+# antenna = "RX"
+# bandwidth_hz = 2400000.0
+
+[device.soapy.gain]
+# none: leave gain untouched; manual/overall: set overall and/or element gains; agc: enable AGC
+mode = "none"
+# gain_db = 30.0
+
+#[[device.soapy.gain.elements]]
+#name = "LNA"
+#gain_db = 32.0
