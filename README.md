@@ -6,6 +6,9 @@ The detector looks for weak electromagnetic leakage near crystal-clock
 harmonics. It scans configured harmonic frequencies, finds narrow peaks, fits a
 shared offset model, and tracks persistent suspects in the TUI.
 
+## Human Says
+see [this](https://www.leommxj.com/2026/06/11/EM-leakage-based-hidden-camera-detection/)
+
 ## Current Workflow
 
 Run the current 24/27 MHz high-band Airspy profile:
