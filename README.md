@@ -6,6 +6,9 @@ The detector looks for weak electromagnetic leakage near crystal-clock
 harmonics. It scans configured harmonic frequencies, finds narrow peaks, fits a
 shared offset model, and tracks persistent suspects in the TUI.
 
+Configuration and scan sessions are shared across frontends. See
+[Core and frontends](docs/architecture.md) for the interfaces and responsibilities.
+
 ## Human Says
 see [this](https://www.leommxj.com/2026/06/11/EM-leakage-based-hidden-camera-detection/)
 
@@ -16,6 +19,14 @@ Run the current 24/27 MHz high-band Airspy profile:
 ```bash
 cargo run -- scan --profile profiles/best_high_airspy.toml
 ```
+
+Use an embedded profile without depending on the working directory:
+
+```bash
+cargo run -- scan --preset 24+27
+```
+
+Other presets are `25`, `all`, `24`, and `27`.
 
 Run the 25 MHz high-band profile:
 
@@ -75,6 +86,7 @@ Controls:
 - `h`: hide selected suspect.
 - `t`: hide/show tracking suspects.
 - `u`: restore manually hidden suspects.
+- `p`: pause, resume, or retry a failed scan through the shared session.
 - `q` or `Esc`: stop.
 
 Suspects keep a stable display order and show the harmonic group, offset, SNR,

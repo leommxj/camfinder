@@ -1,4 +1,5 @@
 use crate::detect::{OffsetEstimate, ProfileDetection};
+use crate::engine::{ScanSession, SessionStatus};
 use crate::frequency::{format_frequency_hz, format_offset_hz};
 use crate::peak::Peak;
 use crate::persistence::{PersistenceSummary, StabilityState};
@@ -17,11 +18,11 @@ use ratatui::Terminal;
 use std::collections::{HashSet, VecDeque};
 use std::io::{self, Stdout};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{Receiver, TryRecvError};
 use std::sync::Arc;
 use std::time::Duration;
 
 pub struct TuiScanState<'a> {
+    pub status: SessionStatus,
     pub pass: usize,
     pub elapsed: Duration,
     pub pass_duration: Duration,
@@ -36,17 +37,6 @@ pub struct TuiScanState<'a> {
     pub peaks_scroll: usize,
     pub logs_scroll: usize,
     pub logs: &'a VecDeque<String>,
-}
-
-#[derive(Clone, Debug)]
-pub struct TuiScanSnapshot {
-    pub pass: usize,
-    pub elapsed: Duration,
-    pub pass_duration: Duration,
-    pub peaks: Vec<Peak>,
-    pub results: Vec<ProfileDetection>,
-    pub summaries: Vec<PersistenceSummary>,
-    pub logs: VecDeque<String>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -64,6 +54,7 @@ pub enum TuiAction {
     ClearHidden,
     ToggleTracking,
     Quit,
+    TogglePause,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -103,9 +94,8 @@ pub struct TuiRenderer {
     terminal: Terminal<CrosstermBackend<Stdout>>,
 }
 
-pub fn run_tui_loop(receiver: Receiver<TuiScanSnapshot>, stop: Arc<AtomicBool>) -> Result<()> {
+pub fn run_tui_loop(session: &mut ScanSession, stop: Arc<AtomicBool>) -> Result<()> {
     let mut renderer = TuiRenderer::new()?;
-    let mut latest = None;
     let mut hidden_suspects = HashSet::new();
     let mut expanded_suspects = HashSet::new();
     let mut hide_tracking = false;
@@ -113,253 +103,115 @@ pub fn run_tui_loop(receiver: Receiver<TuiScanSnapshot>, stop: Arc<AtomicBool>) 
     let mut focus = TuiFocus::Suspects;
     let mut peaks_scroll = 0usize;
     let mut logs_scroll = 0usize;
-    let mut disconnected = false;
 
     while !stop.load(Ordering::Relaxed) {
-        let mut needs_redraw = false;
-
-        loop {
-            match receiver.try_recv() {
-                Ok(snapshot) => {
-                    latest = Some(snapshot);
-                    needs_redraw = true;
-                }
-                Err(TryRecvError::Empty) => break,
-                Err(TryRecvError::Disconnected) => {
-                    disconnected = true;
-                    break;
-                }
-            }
-        }
-
+        let snapshot = session.snapshot();
         for action in renderer.drain_actions()? {
+            let visible =
+                visible_summary_count(&snapshot.persistence, &hidden_suspects, hide_tracking);
             match action {
-                TuiAction::Previous => {
-                    match focus {
-                        TuiFocus::Suspects => {
-                            selected_suspect_index = selected_suspect_index.saturating_sub(1);
-                        }
-                        TuiFocus::Peaks => {
-                            peaks_scroll = peaks_scroll.saturating_sub(1);
-                        }
-                        TuiFocus::Logs => {
-                            logs_scroll = logs_scroll.saturating_add(1);
-                        }
-                    }
-                    needs_redraw = true;
-                }
-                TuiAction::Next => {
-                    match focus {
-                        TuiFocus::Suspects => {
-                            if let Some(snapshot) = latest.as_ref() {
-                                let visible = visible_summary_count(
-                                    &snapshot.summaries,
-                                    &hidden_suspects,
-                                    hide_tracking,
-                                );
-                                if visible > 0 {
-                                    selected_suspect_index =
-                                        (selected_suspect_index + 1).min(visible - 1);
-                                }
+                TuiAction::Previous
+                | TuiAction::Next
+                | TuiAction::PagePrevious
+                | TuiAction::PageNext
+                | TuiAction::Home
+                | TuiAction::End => {
+                    let (position, count, page, reverse) = match focus {
+                        TuiFocus::Suspects => (&mut selected_suspect_index, visible, 5, false),
+                        TuiFocus::Peaks => (&mut peaks_scroll, snapshot.peaks.len(), 10, false),
+                        TuiFocus::Logs => (&mut logs_scroll, snapshot.logs.len(), 5, true),
+                    };
+                    let maximum = count.saturating_sub(1);
+                    let amount = if matches!(action, TuiAction::PagePrevious | TuiAction::PageNext)
+                    {
+                        page
+                    } else {
+                        1
+                    };
+                    *position = match action {
+                        TuiAction::Home => {
+                            if reverse {
+                                maximum
+                            } else {
+                                0
                             }
                         }
-                        TuiFocus::Peaks => {
-                            peaks_scroll = peaks_scroll.saturating_add(1);
-                        }
-                        TuiFocus::Logs => {
-                            logs_scroll = logs_scroll.saturating_sub(1);
-                        }
-                    }
-                    needs_redraw = true;
-                }
-                TuiAction::PagePrevious => {
-                    match focus {
-                        TuiFocus::Suspects => {
-                            selected_suspect_index = selected_suspect_index.saturating_sub(5);
-                        }
-                        TuiFocus::Peaks => {
-                            peaks_scroll = peaks_scroll.saturating_sub(10);
-                        }
-                        TuiFocus::Logs => {
-                            logs_scroll = logs_scroll.saturating_add(5);
-                        }
-                    }
-                    needs_redraw = true;
-                }
-                TuiAction::PageNext => {
-                    match focus {
-                        TuiFocus::Suspects => {
-                            if let Some(snapshot) = latest.as_ref() {
-                                let visible = visible_summary_count(
-                                    &snapshot.summaries,
-                                    &hidden_suspects,
-                                    hide_tracking,
-                                );
-                                if visible > 0 {
-                                    selected_suspect_index =
-                                        (selected_suspect_index + 5).min(visible - 1);
-                                }
+                        TuiAction::End => {
+                            if reverse {
+                                0
+                            } else {
+                                maximum
                             }
                         }
-                        TuiFocus::Peaks => {
-                            peaks_scroll = peaks_scroll.saturating_add(10);
+                        _ if matches!(action, TuiAction::Previous | TuiAction::PagePrevious)
+                            != reverse =>
+                        {
+                            position.saturating_sub(amount)
                         }
-                        TuiFocus::Logs => {
-                            logs_scroll = logs_scroll.saturating_sub(5);
-                        }
-                    }
-                    needs_redraw = true;
+                        _ => position.saturating_add(amount).min(maximum),
+                    };
                 }
-                TuiAction::Home => {
-                    match focus {
-                        TuiFocus::Suspects => selected_suspect_index = 0,
-                        TuiFocus::Peaks => peaks_scroll = 0,
-                        TuiFocus::Logs => {
-                            if let Some(snapshot) = latest.as_ref() {
-                                logs_scroll = snapshot.logs.len().saturating_sub(1);
-                            }
-                        }
-                    }
-                    needs_redraw = true;
-                }
-                TuiAction::End => {
-                    match focus {
-                        TuiFocus::Suspects => {
-                            if let Some(snapshot) = latest.as_ref() {
-                                let visible = visible_summary_count(
-                                    &snapshot.summaries,
-                                    &hidden_suspects,
-                                    hide_tracking,
-                                );
-                                selected_suspect_index = visible.saturating_sub(1);
-                            }
-                        }
-                        TuiFocus::Peaks => {
-                            if let Some(snapshot) = latest.as_ref() {
-                                peaks_scroll = snapshot.peaks.len().saturating_sub(1);
-                            }
-                        }
-                        TuiFocus::Logs => logs_scroll = 0,
-                    }
-                    needs_redraw = true;
-                }
-                TuiAction::FocusPrevious => {
-                    focus = focus.previous();
-                    needs_redraw = true;
-                }
-                TuiAction::FocusNext => {
-                    focus = focus.next();
-                    needs_redraw = true;
-                }
-                TuiAction::ToggleSelectedDetails => {
+                TuiAction::FocusPrevious => focus = focus.previous(),
+                TuiAction::FocusNext => focus = focus.next(),
+                TuiAction::ToggleSelectedDetails | TuiAction::HideSelected => {
                     if focus == TuiFocus::Suspects {
-                        if let Some(snapshot) = latest.as_ref() {
-                            if let Some(key) = selected_suspect_key(
-                                selected_suspect_index,
-                                &snapshot.summaries,
-                                &hidden_suspects,
-                                hide_tracking,
-                            ) {
-                                if expanded_suspects.contains(&key) {
-                                    expanded_suspects.remove(&key);
-                                } else {
-                                    expanded_suspects.insert(key);
-                                }
-                                needs_redraw = true;
-                            }
-                        }
-                    }
-                }
-                TuiAction::HideSelected => {
-                    if focus == TuiFocus::Suspects {
-                        if let Some(snapshot) = latest.as_ref() {
-                            if let Some(key) = selected_suspect_key(
-                                selected_suspect_index,
-                                &snapshot.summaries,
-                                &hidden_suspects,
-                                hide_tracking,
-                            ) {
+                        if let Some(key) = selected_suspect_key(
+                            selected_suspect_index,
+                            &snapshot.persistence,
+                            &hidden_suspects,
+                            hide_tracking,
+                        ) {
+                            if action == TuiAction::HideSelected {
                                 hidden_suspects.insert(key.clone());
                                 expanded_suspects.remove(&key);
-                                selected_suspect_index = clamp_selected_suspect(
-                                    selected_suspect_index,
-                                    &snapshot.summaries,
-                                    &hidden_suspects,
-                                    hide_tracking,
-                                );
-                                needs_redraw = true;
+                            } else if !expanded_suspects.remove(&key) {
+                                expanded_suspects.insert(key);
                             }
                         }
                     }
                 }
-                TuiAction::ClearHidden => {
-                    hidden_suspects.clear();
-                    if let Some(snapshot) = latest.as_ref() {
-                        selected_suspect_index = clamp_selected_suspect(
-                            selected_suspect_index,
-                            &snapshot.summaries,
-                            &hidden_suspects,
-                            hide_tracking,
-                        );
-                    }
-                    needs_redraw = true;
-                }
-                TuiAction::ToggleTracking => {
-                    hide_tracking = !hide_tracking;
-                    if let Some(snapshot) = latest.as_ref() {
-                        selected_suspect_index = clamp_selected_suspect(
-                            selected_suspect_index,
-                            &snapshot.summaries,
-                            &hidden_suspects,
-                            hide_tracking,
-                        );
-                    }
-                    needs_redraw = true;
-                }
-                TuiAction::Quit => {
-                    stop.store(true, Ordering::Relaxed);
-                    break;
-                }
+                TuiAction::ClearHidden => hidden_suspects.clear(),
+                TuiAction::ToggleTracking => hide_tracking = !hide_tracking,
+                TuiAction::TogglePause => session.toggle_pause()?,
+                TuiAction::Quit => stop.store(true, Ordering::Relaxed),
             }
-        }
-
-        if let Some(snapshot) = latest.as_ref() {
             selected_suspect_index = clamp_selected_suspect(
                 selected_suspect_index,
-                &snapshot.summaries,
+                &snapshot.persistence,
                 &hidden_suspects,
                 hide_tracking,
             );
-            peaks_scroll = peaks_scroll.min(snapshot.peaks.len().saturating_sub(1));
-            logs_scroll = logs_scroll.min(snapshot.logs.len().saturating_sub(1));
-
-            if needs_redraw {
-                renderer.draw(&TuiScanState {
-                    pass: snapshot.pass,
-                    elapsed: snapshot.elapsed,
-                    pass_duration: snapshot.pass_duration,
-                    peaks: &snapshot.peaks,
-                    results: &snapshot.results,
-                    summaries: &snapshot.summaries,
-                    hidden_suspects: &hidden_suspects,
-                    expanded_suspects: &expanded_suspects,
-                    hide_tracking,
-                    selected_suspect_index,
-                    focus,
-                    peaks_scroll,
-                    logs_scroll,
-                    logs: &snapshot.logs,
-                })?;
-            }
         }
-
-        if disconnected {
+        selected_suspect_index = clamp_selected_suspect(
+            selected_suspect_index,
+            &snapshot.persistence,
+            &hidden_suspects,
+            hide_tracking,
+        );
+        peaks_scroll = peaks_scroll.min(snapshot.peaks.len().saturating_sub(1));
+        logs_scroll = logs_scroll.min(snapshot.logs.len().saturating_sub(1));
+        renderer.draw(&TuiScanState {
+            status: snapshot.status,
+            pass: snapshot.pass,
+            elapsed: Duration::from_secs_f64(snapshot.elapsed_seconds),
+            pass_duration: Duration::from_secs_f64(snapshot.pass_seconds),
+            peaks: &snapshot.peaks,
+            results: &snapshot.results,
+            summaries: &snapshot.persistence,
+            hidden_suspects: &hidden_suspects,
+            expanded_suspects: &expanded_suspects,
+            hide_tracking,
+            selected_suspect_index,
+            focus,
+            peaks_scroll,
+            logs_scroll,
+            logs: &snapshot.logs,
+        })?;
+        if snapshot.status == SessionStatus::Stopped {
             break;
         }
-
-        std::thread::sleep(Duration::from_millis(50));
+        std::thread::sleep(Duration::from_millis(100));
     }
-
     Ok(())
 }
 
@@ -391,7 +243,8 @@ impl TuiRenderer {
                 .split(vertical[1]);
 
             let header = Paragraph::new(format!(
-                "camfinder  pass={}  elapsed={}  pass={}  peaks={}  hidden={}  tracking={}  focus={}  Tab focus  ↑/↓ move/scroll  e/Enter expand  h hide  t tracking  u restore  q stop",
+                "camfinder  {:?}  pass={}  elapsed={}  pass={}  peaks={}  hidden={}  tracking={}  focus={}  Tab focus  ↑/↓ move/scroll  e/Enter expand  h hide  t tracking  u restore  p pause/resume/retry  q stop",
+                state.status,
                 state.pass,
                 format_duration(state.elapsed),
                 format_duration(state.pass_duration),
@@ -474,6 +327,7 @@ impl TuiRenderer {
                     KeyCode::Char('t') => {
                         actions.push(TuiAction::ToggleTracking);
                     }
+                    KeyCode::Char('p') => actions.push(TuiAction::TogglePause),
                     KeyCode::Char('q') | KeyCode::Esc => {
                         actions.push(TuiAction::Quit);
                     }
@@ -533,7 +387,7 @@ fn suspicious_panel(state: &TuiScanState<'_>, area: Rect) -> Paragraph<'static> 
             selected_line = lines.len();
         }
         let expanded = state.expanded_suspects.contains(&summary.suspect_key);
-        let result = current_result_for(summary, state.results);
+        let result = summary.current_result(state.results);
         let (hits, required_hits, score, min_score, snr_sum, snr_avg, spread, offset, group) =
             if let Some(result) = result {
                 (
@@ -667,29 +521,6 @@ fn suspicious_panel(state: &TuiScanState<'_>, area: Rect) -> Paragraph<'static> 
         .block(panel_block("Suspects", state.focus == TuiFocus::Suspects))
         .scroll((to_u16(scroll), 0))
         .wrap(Wrap { trim: false })
-}
-
-fn current_result_for<'a>(
-    summary: &PersistenceSummary,
-    results: &'a [ProfileDetection],
-) -> Option<&'a ProfileDetection> {
-    results.iter().find(|result| {
-        if result.profile != summary.profile {
-            return false;
-        }
-
-        match (summary.offset_group_hz, result.offset_group_hz) {
-            (Some(summary_hz), Some(result_hz)) => {
-                let tolerance = summary
-                    .offset_tolerance_hz
-                    .max(result.offset_tolerance_hz)
-                    .max(1.0);
-                (summary_hz - result_hz).abs() <= tolerance
-            }
-            (None, None) => true,
-            _ => false,
-        }
-    })
 }
 
 fn visible_summary_count(
