@@ -170,7 +170,11 @@ mod real {
                 settings.device_args
             ));
         }
-        Ok(devices.remove(settings.device_index).to_string())
+        let mut selected = devices.remove(settings.device_index);
+        for (key, value) in soapysdr::Args::from(settings.device_args.as_str()).iter() {
+            selected.set(key, value);
+        }
+        Ok(selected.to_string())
     }
 
     fn configure_device(device: &Device, settings: &SoapySettings) -> Result<()> {
@@ -355,6 +359,10 @@ mod real {
                     }
                     Err(error) if error.code == ErrorCode::Overflow => {
                         statistics.overflows += 1;
+                        if iq.is_empty() {
+                            chunks_to_discard = 2;
+                            continue;
+                        }
                         return Err(anyhow!("SoapySDR RX overflow after {} IQ samples; discontinuous capture rejected ({} overflow(s))", iq.len(), statistics.overflows));
                     }
                     Err(error) => return Err(error.into()),
