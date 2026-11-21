@@ -99,7 +99,7 @@ dependencies = [
 
 [[package]]
 name = "camfinder"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "rs-spy",
@@ -112,7 +112,7 @@ dependencies = [
 
 [[package]]
 name = "camfinder-cardputer-zero"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "camfinder",
@@ -124,7 +124,7 @@ dependencies = [
 
 [[package]]
 name = "camfinder-terminal"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "camfinder",
@@ -1305,7 +1305,7 @@ dependencies = [
 
 [[package]]
 name = "xtask"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "png",

@@ -15,7 +15,7 @@ From the repository root:
 
 ```sh
 cargo xtask cardputer-zero
-sudo apt install ./target/dist/camfinder-cardputer-zero_0.1.0-1_arm64.deb
+sudo apt install ./target/dist/camfinder-cardputer-zero_0.1.1-1_arm64.deb
 ```
 
 The package installs an entry in the Cardputer Zero launcher that explicitly
