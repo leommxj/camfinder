@@ -1,11 +1,9 @@
-#![cfg(feature = "cli")]
-
 use std::process::Command;
 
 #[test]
 fn explicit_scans_and_default_config_work_outside_the_repository() {
     let profile = format!(
-        "{}/profiles/best_high_airspy.toml",
+        "{}/../../profiles/best_high_airspy.toml",
         env!("CARGO_MANIFEST_DIR")
     );
     for args in [

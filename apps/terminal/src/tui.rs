@@ -1,10 +1,10 @@
-use crate::detect::{OffsetEstimate, ProfileDetection};
-use crate::engine::{ScanSession, SessionStatus};
-use crate::frequency::{format_frequency_hz, format_offset_hz};
-use crate::peak::Peak;
-use crate::persistence::{PersistenceSummary, StabilityState};
-use crate::timeparse::format_duration;
 use anyhow::Result;
+use camfinder::detect::{OffsetEstimate, ProfileDetection};
+use camfinder::engine::{ScanSession, SessionStatus};
+use camfinder::frequency::{format_frequency_hz, format_offset_hz};
+use camfinder::peak::Peak;
+use camfinder::persistence::{PersistenceSummary, StabilityState};
+use camfinder::timeparse::format_duration;
 use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
 use crossterm::terminal::{EnterAlternateScreen, LeaveAlternateScreen};
@@ -682,7 +682,7 @@ fn score_strength_bar(score: f64, min_score: f64) -> String {
     format!("[{}{}]", "#".repeat(filled), "-".repeat(WIDTH - filled))
 }
 
-fn format_hit_error(result: &ProfileDetection, hit: &crate::detect::DetectionHit) -> String {
+fn format_hit_error(result: &ProfileDetection, hit: &camfinder::detect::DetectionHit) -> String {
     match result.offset {
         Some(OffsetEstimate::Ppm { .. }) => {
             format!(

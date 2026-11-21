@@ -1,3 +1,5 @@
+mod tui;
+
 use anyhow::{anyhow, Result};
 #[cfg(feature = "airspy")]
 use camfinder::airspy_backend::list_airspy_devices;
@@ -13,7 +15,6 @@ use camfinder::persistence::{PersistenceSummary, StabilityState};
 use camfinder::sdr::TargetStatistics;
 use camfinder::soapy_backend::list_soapy_devices;
 use camfinder::timeparse::format_duration;
-use camfinder::tui::run_tui_loop;
 use clap::{ArgAction, Parser, Subcommand, ValueEnum};
 use serde::Serialize;
 use std::io::{self, IsTerminal};
@@ -21,6 +22,7 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc};
 use std::time::Duration;
+use tui::run_tui_loop;
 
 #[derive(Debug, Parser)]
 #[command(name = "camfinder")]

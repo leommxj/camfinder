@@ -4,6 +4,20 @@ The `camfinder` library owns configuration and scanning behavior. The terminal
 frontend and Cardputer Zero application translate input into core requests and
 render the returned state. SDL2, Ratatui and Clap are frontend dependencies.
 
+| Package | Directory | Responsibility |
+|---|---|---|
+| `camfinder` | `src/` | Core library and hardware backends |
+| `camfinder-terminal` | `apps/terminal/` | CLI arguments, TUI, table and JSON output; builds the `camfinder` binary |
+| `camfinder-cardputer-zero` | `apps/cardputer-zero/` | Small-screen display and device input |
+| `xtask` | `xtask/` | Build and packaging tools |
+
+The default workspace members are the core and terminal application, so root
+`cargo run` launches the terminal application and `cargo test` covers both.
+Use `cargo test --workspace` to include the device application and build tools.
+The terminal application's `airspy` and `soapy` features enable the corresponding
+core backends. Core tests stay in `tests/`; CLI integration tests live in
+`apps/terminal/tests/`.
+
 ## Configuration
 
 `config::ScanRequest` accepts configuration edits without depending on a UI
@@ -58,6 +72,7 @@ owns SDL rendering, framebuffer/input adaptation, page navigation and PNG
 screenshots. Neither frontend selects capture budgets, merges profile settings,
 tracks candidates or writes scan recordings directly.
 
-The core builds with `cargo check --no-default-features`. Core configuration and
-session tests run without a receiver; CLI integration tests compare subprocess
-output with the engine configured through shared preferences.
+The core builds with `cargo check -p camfinder --no-default-features`.
+Core configuration and session tests run without a receiver; CLI integration
+tests compare subprocess output with the engine configured through shared
+preferences.

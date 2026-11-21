@@ -102,10 +102,6 @@ name = "camfinder"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "clap",
- "crossterm",
- "ctrlc",
- "ratatui",
  "rs-spy",
  "rustfft",
  "serde",
@@ -124,6 +120,21 @@ dependencies = [
  "png",
  "sdl2",
  "serde_json",
+]
+
+[[package]]
+name = "camfinder-terminal"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "camfinder",
+ "clap",
+ "crossterm",
+ "ctrlc",
+ "ratatui",
+ "serde",
+ "serde_json",
+ "toml",
 ]
 
 [[package]]
