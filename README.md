@@ -6,6 +6,9 @@ The detector looks for weak electromagnetic leakage near crystal-clock
 harmonics. It scans configured harmonic frequencies, finds narrow peaks, fits a
 shared offset model, and tracks persistent suspects in the TUI.
 
+The Cargo workspace contains the portable library and CLI, plus an optional
+[Cardputer Zero application](apps/cardputer-zero/README.md).
+
 Configuration and scan sessions are shared across frontends. See
 [Core and frontends](docs/architecture.md) for the interfaces and responsibilities.
 

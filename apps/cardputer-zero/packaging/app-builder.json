@@ -1,0 +1,27 @@
+{
+  "app_name": "Camfinder",
+  "package_name": "camfinder-cardputer-zero",
+  "version": "0.1.0",
+  "store": {
+    "summary": "Scan SDR signals and track harmonic candidates with Airspy.",
+    "description": "Airspy spectrum scanning, harmonic matching, and persistent candidate tracking for CardputerZero.",
+    "locales": {
+      "zh-CN": { "summary": "使用 Airspy 扫描频谱、匹配谐波并持续跟踪候选信号。" }
+    },
+    "icon": "assets/icon.png",
+    "screenshots": ["assets/screenshot.png"],
+    "categories": ["Radio & Comms", "Hardware & IoT"],
+    "permissions": {
+      "camera": false,
+      "microphone": false,
+      "imu": false,
+      "network": false,
+      "additional_hardware": true,
+      "background_service": false,
+      "external_display": false
+    },
+    "author": { "display_name": "leommxj", "github": "leommxj" },
+    "license": "WTFPL",
+    "share_code": "CAMF"
+  }
+}

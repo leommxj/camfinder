@@ -2,6 +2,15 @@
 name = "camfinder"
 version = "0.1.0"
 edition = "2021"
+authors = ["leommxj"]
+license = "WTFPL"
+default-run = "camfinder"
+
+[workspace]
+members = ["apps/cardputer-zero", "xtask"]
+default-members = ["."]
+exclude = ["vendor/rs-spy"]
+resolver = "2"
 
 [[bin]]
 name = "camfinder"

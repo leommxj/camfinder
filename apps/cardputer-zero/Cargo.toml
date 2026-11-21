@@ -1,0 +1,14 @@
+[package]
+name = "camfinder-cardputer-zero"
+version = "0.1.0"
+edition = "2021"
+authors = ["leommxj"]
+license = "WTFPL"
+
+[dependencies]
+anyhow = "1"
+ctrlc = "3.5"
+camfinder = { path = "../..", default-features = false, features = ["airspy"] }
+sdl2 = { version = "0.38", features = ["ttf"] }
+serde_json = "1"
+png = "0.17"
