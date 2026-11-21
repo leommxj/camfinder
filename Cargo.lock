@@ -667,8 +667,6 @@ dependencies = [
 [[package]]
 name = "rs-spy"
 version = "0.4.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "fcf6d6d437bef2d48c1a65abaae77621905d68ea7ef5809a7ac2a1be881feee4"
 dependencies = [
  "num-complex",
  "nusb",

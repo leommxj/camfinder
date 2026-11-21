@@ -25,18 +25,19 @@ pub struct AppConfig {
 
 impl Default for AppConfig {
     fn default() -> Self {
-        let mut config: Self =
-            toml::from_str(DEFAULT_CONFIG_TOML).expect("embedded default config must parse");
-        config
-            .load_referenced_profiles(Path::new("."))
-            .expect("default profile files must parse");
-        config
+        Self::load_defaults().expect("default profile files must parse")
     }
 }
 
 impl AppConfig {
     pub fn default_toml() -> &'static str {
         DEFAULT_CONFIG_TOML
+    }
+
+    pub fn load_defaults() -> Result<Self> {
+        let mut config: Self = toml::from_str(DEFAULT_CONFIG_TOML)?;
+        config.load_referenced_profiles(Path::new("."))?;
+        Ok(config)
     }
 
     pub fn load(path: &Path) -> Result<Self> {
@@ -72,6 +73,8 @@ pub struct ScanSettings {
     pub record_spectrum_bins: usize,
     #[serde(default = "default_record_band_decimation")]
     pub record_band_decimation: usize,
+    #[serde(default)]
+    pub record_mode: RecordMode,
     #[serde(default = "default_output")]
     pub output: String,
 }
@@ -80,6 +83,15 @@ impl Default for ScanSettings {
     fn default() -> Self {
         default_scan_settings()
     }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RecordMode {
+    Peaks,
+    Summary,
+    #[default]
+    Spectrum,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

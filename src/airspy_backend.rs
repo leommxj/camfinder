@@ -1,9 +1,16 @@
 use crate::config::{DetectionProfile, ScanSettings};
-use crate::dsp::{u16le_to_f32_real, Complex32};
+use crate::dsp::Complex32;
 use crate::peak::Peak;
-use crate::sdr::{scan_sdr_peaks, AirspyGainSettings, AirspySettings, IqBackend, SdrScanConfig};
+use crate::sdr::{
+    scan_sdr_peaks, AirspyGainSettings, AirspySettings, CaptureStatistics, IqBackend, IqCapture,
+    SdrScanConfig,
+};
 use anyhow::{anyhow, Context, Result};
 use rs_spy::{Airspy, IqConverter, RECOMMENDED_BUFFER_SIZE};
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc,
+};
 use std::time::{Duration, Instant};
 
 #[derive(Clone, Debug)]
@@ -22,12 +29,13 @@ pub fn list_airspy_devices() -> Result<Vec<AirspyDeviceInfo>> {
 }
 
 pub struct AirspyScanner {
-    device: Airspy,
+    device: Option<Airspy>,
     settings: AirspySettings,
 }
 
 impl AirspyScanner {
     pub fn open(settings: AirspySettings) -> Result<Self> {
+        settings.validate()?;
         let device = Airspy::open_by_index(settings.device_index).with_context(|| {
             format!(
                 "failed to open Airspy device index {}",
@@ -35,7 +43,10 @@ impl AirspyScanner {
             )
         })?;
         configure_device(&device, &settings)?;
-        Ok(Self { device, settings })
+        Ok(Self {
+            device: Some(device),
+            settings,
+        })
     }
 
     pub fn scan_peaks(
@@ -67,12 +78,29 @@ impl IqBackend for AirspyScanner {
 
     fn tune(&mut self, center_hz: f64) -> Result<f64> {
         let center_hz = center_hz.round() as u32;
-        self.device.set_freq(center_hz)?;
+        self.device
+            .as_ref()
+            .ok_or_else(|| anyhow!("Airspy device unavailable after stream failure"))?
+            .set_freq(center_hz)?;
         Ok(center_hz as f64)
     }
 
     fn collect_iq(&mut self) -> Result<Vec<Complex32>> {
-        collect_iq(&self.device, &self.settings)
+        Ok(self.capture(&Arc::new(AtomicBool::new(false)))?.iq)
+    }
+
+    fn settle(&mut self, _stop: &Arc<AtomicBool>) -> Result<()> {
+        Ok(())
+    }
+
+    fn capture(&mut self, stop: &Arc<AtomicBool>) -> Result<IqCapture> {
+        let device = self
+            .device
+            .take()
+            .ok_or_else(|| anyhow!("Airspy device unavailable after stream failure"))?;
+        let (device, result) = collect_iq(device, &self.settings, stop);
+        self.device = device;
+        result
     }
 
     fn gain_label(&self) -> Option<String> {
@@ -90,11 +118,6 @@ pub fn scan_airspy_peaks(
 }
 
 fn configure_device(device: &Airspy, settings: &AirspySettings) -> Result<()> {
-    let rates = device.supported_sample_rates()?;
-    if !rates.is_empty() && !rates.contains(&settings.sample_rate_hz) {
-        // Some firmware accepts fallback rates even when they are not advertised.
-    }
-
     device
         .set_sample_rate_for_iq(settings.sample_rate_hz)
         .with_context(|| format!("failed to set sample rate {}", settings.sample_rate_hz))?;
@@ -136,36 +159,126 @@ fn apply_gain(device: &Airspy, gain: &AirspyGainSettings) -> Result<()> {
     Ok(())
 }
 
-fn collect_iq(device: &Airspy, settings: &AirspySettings) -> Result<Vec<Complex32>> {
-    let duration = Duration::from_millis(settings.dwell_ms);
-    let deadline = Instant::now() + duration;
-    let mut raw = vec![0u8; RECOMMENDED_BUFFER_SIZE];
-    let mut converter = IqConverter::new();
-    let mut iq = Vec::new();
-    let mut chunks_to_discard = 2usize;
-
-    device.start_rx()?;
+fn collect_iq(
+    device: Airspy,
+    settings: &AirspySettings,
+    stop: &Arc<AtomicBool>,
+) -> (Option<Airspy>, Result<IqCapture>) {
+    if let Err(error) = device.start_rx() {
+        let stopped = device.stop_rx();
+        return (stopped.ok().map(|_| device), Err(error.into()));
+    }
+    let reader = match device.into_multi_transfer_reader(4, RECOMMENDED_BUFFER_SIZE) {
+        Ok(reader) => reader,
+        Err(error) => return (None, Err(error.into())),
+    };
+    let started = Instant::now();
+    let settle_deadline = started + Duration::from_millis(settings.settle_ms);
+    let timeout_ms = if settings.fft_frames.is_some() {
+        settings.capture_timeout_ms
+    } else {
+        settings.capture_timeout_ms.max(
+            settings
+                .settle_ms
+                .saturating_add(settings.dwell_ms)
+                .saturating_add(250),
+        )
+    };
+    let timeout = Duration::from_millis(timeout_ms);
+    let deadline = started + timeout;
+    let dwell_deadline = settle_deadline + Duration::from_millis(settings.dwell_ms);
+    let target_samples = settings
+        .fft_frames
+        .map(|frames| frames.saturating_mul(settings.fft_size));
+    let mut statistics = CaptureStatistics::default();
     let result = (|| -> Result<Vec<Complex32>> {
-        while Instant::now() < deadline {
-            let n = device.read_sync_timeout(&mut raw, Duration::from_millis(1500))?;
-            if n == 0 {
+        let mut converter = IqConverter::new();
+        let mut real = Vec::with_capacity(RECOMMENDED_BUFFER_SIZE / 2);
+        let mut iq = Vec::with_capacity(target_samples.unwrap_or(settings.fft_size));
+        let mut warmup_chunks = 2;
+        let settle_samples = settings.sample_rate_hz as u128 * settings.settle_ms as u128 / 1000;
+        let mut settled_samples = 0u128;
+        let mut last_data = Instant::now();
+        loop {
+            if stop.load(Ordering::Relaxed) {
+                statistics.interrupted = true;
+                break;
+            }
+            if target_samples.is_some_and(|target| iq.len() >= target) {
+                break;
+            }
+            if target_samples.is_none() && Instant::now() >= dwell_deadline {
+                break;
+            }
+            if Instant::now() >= deadline {
+                return Err(anyhow!(
+                    "Airspy capture timed out after {} ms ({} IQ samples, {} raw bytes)",
+                    timeout_ms,
+                    iq.len(),
+                    statistics.raw_bytes
+                ));
+            }
+            let Some(raw) = reader.recv_timeout(Duration::from_millis(20))? else {
+                if last_data.elapsed() >= Duration::from_millis(250) {
+                    statistics.timeouts += 1;
+                    return Err(anyhow!("Airspy USB receive timed out"));
+                }
+                continue;
+            };
+            last_data = Instant::now();
+            statistics.raw_bytes += raw.len() as u64;
+            if raw.len() % 4 != 0 {
+                return Err(anyhow!(
+                    "Airspy returned an incomplete IQ transfer ({} bytes)",
+                    raw.len()
+                ));
+            }
+            let conversion_started = Instant::now();
+            real.clear();
+            real.extend(
+                raw.chunks_exact(2)
+                    .map(|bytes| u16::from_le_bytes([bytes[0], bytes[1]]) as f32 / 32768.0),
+            );
+            converter.process(&mut real);
+            statistics.conversion_ms += conversion_started.elapsed().as_secs_f64() * 1000.0;
+            let converted_len = real.len() / 2;
+            if Instant::now() < settle_deadline || settled_samples < settle_samples {
+                settled_samples += converted_len as u128;
+                statistics.discarded_iq_samples += converted_len;
                 continue;
             }
-            if chunks_to_discard > 0 {
-                chunks_to_discard -= 1;
+            if warmup_chunks > 0 {
+                warmup_chunks -= 1;
+                statistics.discarded_iq_samples += converted_len;
                 continue;
             }
-            let mut real = u16le_to_f32_real(&raw[..n]);
-            iq.extend(converter.process_to_complex(&mut real));
+            if iq.is_empty() {
+                statistics.settle_ms =
+                    conversion_started.duration_since(started).as_secs_f64() * 1000.0;
+            }
+            let count = target_samples
+                .map(|target| target.saturating_sub(iq.len()).min(converted_len))
+                .unwrap_or(converted_len);
+            statistics.discarded_iq_samples += converted_len - count;
+            let complex_started = Instant::now();
+            iq.extend(
+                real.chunks_exact(2)
+                    .take(count)
+                    .map(|pair| Complex32::new(pair[0], pair[1])),
+            );
+            statistics.conversion_ms += complex_started.elapsed().as_secs_f64() * 1000.0;
         }
         Ok(iq)
     })();
-    let stop_result = device.stop_rx();
-
-    match (result, stop_result) {
-        (Ok(iq), Ok(())) => Ok(iq),
-        (Err(err), _) => Err(err),
-        (Ok(_), Err(err)) => Err(err.into()),
+    statistics.capture_ms = started.elapsed().as_secs_f64() * 1000.0;
+    let reclaimed = reader.stop_and_reclaim();
+    match reclaimed {
+        Ok(device) => (Some(device), result.map(|iq| IqCapture { iq, statistics })),
+        Err(error) => (
+            None,
+            Err(error)
+                .context("Airspy async stream failed while stopping or reclaiming the device"),
+        ),
     }
 }
 

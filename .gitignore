@@ -1,5 +1,7 @@
 /target
 /captures/
+/vendor/rs-spy/target/
+/vendor/rs-spy/Cargo.lock
 *.iq
 *.bin
 *.wav

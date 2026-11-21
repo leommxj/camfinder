@@ -1,13 +1,14 @@
-use crate::config::{DetectionProfile, ScanSettings, DEFAULT_CONFIG_TOML};
-use crate::dsp::{analyze_spectrum_near, Complex32, PeakCandidate, SpectrumSettings};
+use crate::config::{DetectionProfile, RecordMode, ScanSettings, DEFAULT_CONFIG_TOML};
+use crate::dsp::{Complex32, PeakCandidate, SpectrumAnalyzer, SpectrumSettings};
 use crate::frequency::{format_frequency_hz, MHZ};
 use crate::peak::{Peak, SpectrumBand};
 use anyhow::{anyhow, Context, Result};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
-use std::sync::mpsc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{mpsc, Arc};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct DeviceSettings {
@@ -19,6 +20,14 @@ pub struct DeviceSettings {
     pub airspy: AirspySettings,
     #[serde(default)]
     pub soapy: SoapySettings,
+    #[serde(default)]
+    pub replay: ReplaySettings,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct ReplaySettings {
+    #[serde(default)]
+    pub manifest: Option<PathBuf>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -42,16 +51,72 @@ pub trait IqBackend {
     fn tune(&mut self, center_hz: f64) -> Result<f64>;
     fn collect_iq(&mut self) -> Result<Vec<Complex32>>;
 
+    fn capture(&mut self, _stop: &Arc<AtomicBool>) -> Result<IqCapture> {
+        let started = Instant::now();
+        let iq = self.collect_iq()?;
+        Ok(IqCapture {
+            statistics: CaptureStatistics {
+                capture_ms: started.elapsed().as_secs_f64() * 1000.0,
+                ..Default::default()
+            },
+            iq,
+        })
+    }
+
+    fn settle(&mut self, stop: &Arc<AtomicBool>) -> Result<()> {
+        interruptible_sleep(Duration::from_millis(self.scan_config().settle_ms), stop);
+        Ok(())
+    }
+
     fn gain_label(&self) -> Option<String> {
         None
     }
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Default, Serialize)]
+pub struct CaptureStatistics {
+    pub capture_ms: f64,
+    pub settle_ms: f64,
+    pub conversion_ms: f64,
+    pub raw_bytes: u64,
+    pub timeouts: u64,
+    pub overflows: u64,
+    pub discarded_iq_samples: usize,
+    pub interrupted: bool,
+}
+
+pub struct IqCapture {
+    pub iq: Vec<Complex32>,
+    pub statistics: CaptureStatistics,
+}
+
+#[derive(Clone, Debug, Default, Serialize)]
+pub struct TargetStatistics {
+    pub source: String,
+    pub target_hz: f64,
+    pub actual_center_hz: f64,
+    pub tune_ms: f64,
+    pub settle_ms: f64,
+    pub conversion_ms: f64,
+    pub iq_samples: usize,
+    pub fft_frames: usize,
+    pub capture_ms: f64,
+    pub analysis_ms: f64,
+    pub queue_wait_ms: f64,
+    pub raw_bytes: u64,
+    pub timeouts: u64,
+    pub overflows: u64,
+    pub discarded_iq_samples: usize,
+    pub interrupted: bool,
+}
+
+#[derive(Clone, Debug, Default, Serialize)]
 pub struct SdrScanOutput {
     pub peaks: Vec<Peak>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub spectrum_bands: Vec<SpectrumBand>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub statistics: Vec<TargetStatistics>,
 }
 
 pub fn scan_sdr_peaks<B: IqBackend + ?Sized>(
@@ -69,143 +134,248 @@ pub fn scan_sdr<B: IqBackend + ?Sized>(
     scan: &ScanSettings,
     log: &mut dyn FnMut(String),
 ) -> Result<SdrScanOutput> {
-    let target_freqs_hz = unique_target_freqs_hz(profiles);
-    if target_freqs_hz.is_empty() {
-        return Ok(SdrScanOutput {
-            peaks: Vec::new(),
-            spectrum_bands: Vec::new(),
-        });
+    SdrPipeline::new().scan(
+        backend,
+        profiles,
+        scan,
+        &Arc::new(AtomicBool::new(false)),
+        log,
+    )
+}
+
+pub struct SdrPipeline {
+    sender: Option<mpsc::SyncSender<AnalysisTask>>,
+    receiver: mpsc::Receiver<Result<AnalysisResult>>,
+    worker: Option<thread::JoinHandle<()>>,
+}
+
+impl Default for SdrPipeline {
+    fn default() -> Self {
+        Self::new()
     }
+}
 
-    let mut peaks = Vec::new();
-    let mut spectrum_bands = Vec::new();
-    let mut next_id = 1;
-    let mut batches = Vec::new();
-
-    thread::scope(|scope| -> Result<()> {
-        let (task_sender, task_receiver) = mpsc::channel::<AnalysisTask>();
-        let (result_sender, result_receiver) = mpsc::channel::<Result<AnalysisResult>>();
-        let worker = scope.spawn(move || {
-            for task in task_receiver {
-                let result = analyze_spectrum_near(
-                    &task.iq,
-                    task.center_hz,
-                    task.target_hz,
-                    &task.spectrum_settings,
-                )
-                .map(|analysis| AnalysisResult {
-                    sequence: task.sequence,
-                    source_name: task.source_name,
-                    target_hz: task.target_hz,
-                    candidates: analysis.candidates,
-                    band: analysis.band,
-                });
-
-                if result_sender.send(result).is_err() {
+impl SdrPipeline {
+    pub fn new() -> Self {
+        let (sender, tasks) = mpsc::sync_channel::<AnalysisTask>(1);
+        let (results, receiver) = mpsc::channel();
+        let worker = thread::spawn(move || {
+            let mut analyzer = SpectrumAnalyzer::new();
+            for task in tasks {
+                let started = Instant::now();
+                let result = analyzer
+                    .analyze(&task.iq, task.center_hz, task.target_hz, &task.settings)
+                    .map(|analysis| {
+                        let mut statistics = task.statistics;
+                        statistics.analysis_ms = started.elapsed().as_secs_f64() * 1000.0;
+                        AnalysisResult {
+                            sequence: task.sequence,
+                            source_name: task.source_name,
+                            target_hz: task.target_hz,
+                            candidates: analysis.candidates,
+                            band: analysis.band,
+                            statistics,
+                        }
+                    });
+                if results.send(result).is_err() {
                     break;
                 }
             }
         });
-
-        let mut expected_results = 0usize;
-        for (sequence, target_hz) in target_freqs_hz.iter().copied().enumerate() {
-            let source_name = backend.source_name().to_string();
-            let settings = backend.scan_config();
-            let center_hz = target_hz.round();
-            let gain = backend
-                .gain_label()
-                .map(|gain| format!(" gain={gain}"))
-                .unwrap_or_default();
-            log(format!(
-                "{source_name} scan: tune={} dwell={} ms fft={}{}",
-                format_frequency_hz(target_hz),
-                settings.dwell_ms,
-                settings.fft_size,
-                gain
-            ));
-
-            let actual_center_hz = backend
-                .tune(center_hz)
-                .with_context(|| format!("failed to tune {source_name} to {center_hz:.0} Hz"))?;
-            if settings.settle_ms > 0 {
-                thread::sleep(Duration::from_millis(settings.settle_ms));
-            }
-
-            let iq = backend.collect_iq().with_context(|| {
-                format!(
-                    "failed while collecting {source_name} samples at {}",
-                    format_frequency_hz(target_hz)
-                )
-            })?;
-
-            let spectrum_settings = SpectrumSettings {
-                sample_rate_hz: settings.sample_rate_hz,
-                fft_size: settings.fft_size,
-                search_window_hz: scan.peak_search_window_hz,
-                dc_notch_hz: settings.dc_notch_hz,
-                min_peak_snr_db: scan.min_peak_snr_db,
-                max_peaks: scan.max_peaks_per_freq,
-                spectrum_window_bins: if scan.record_path.is_some() {
-                    scan.record_spectrum_bins
-                } else {
-                    0
-                },
-                band_decimation: if scan.record_path.is_some() {
-                    scan.record_band_decimation.max(1)
-                } else {
-                    0
-                },
-            };
-
-            task_sender
-                .send(AnalysisTask {
-                    sequence,
-                    source_name,
-                    target_hz,
-                    center_hz: actual_center_hz,
-                    iq,
-                    spectrum_settings,
-                })
-                .map_err(|_| anyhow!("SDR analysis worker stopped"))?;
-            expected_results += 1;
-        }
-        drop(task_sender);
-
-        for _ in 0..expected_results {
-            let result = result_receiver
-                .recv()
-                .map_err(|_| anyhow!("SDR analysis worker stopped before returning results"))??;
-            log(format!(
-                "{} peaks: target={} count={}",
-                result.source_name,
-                format_frequency_hz(result.target_hz),
-                result.candidates.len()
-            ));
-            batches.push(result);
-        }
-
-        worker
-            .join()
-            .map_err(|_| anyhow!("SDR analysis worker panicked"))?;
-        Ok(())
-    })?;
-
-    batches.sort_by_key(|batch| batch.sequence);
-    for mut batch in batches {
-        if let Some(mut band) = batch.band.take() {
-            band.source = Some(batch.source_name.clone());
-            spectrum_bands.push(band);
-        }
-        for candidate in batch.candidates {
-            peaks.push(candidate.into_peak(next_id, batch.source_name.clone()));
-            next_id += 1;
+        Self {
+            sender: Some(sender),
+            receiver,
+            worker: Some(worker),
         }
     }
 
-    Ok(SdrScanOutput {
-        peaks,
-        spectrum_bands,
-    })
+    pub fn scan<B: IqBackend + ?Sized>(
+        &mut self,
+        backend: &mut B,
+        profiles: &[DetectionProfile],
+        scan: &ScanSettings,
+        stop: &Arc<AtomicBool>,
+        log: &mut dyn FnMut(String),
+    ) -> Result<SdrScanOutput> {
+        self.scan_with_progress(backend, profiles, scan, stop, log, &mut |_| {})
+    }
+
+    pub fn scan_with_progress<B: IqBackend + ?Sized>(
+        &mut self,
+        backend: &mut B,
+        profiles: &[DetectionProfile],
+        scan: &ScanSettings,
+        stop: &Arc<AtomicBool>,
+        log: &mut dyn FnMut(String),
+        progress: &mut dyn FnMut(&TargetStatistics),
+    ) -> Result<SdrScanOutput> {
+        let mut batches = Vec::new();
+        let mut pending = 0usize;
+        let capture_result = (|| -> Result<()> {
+            for (sequence, target_hz) in unique_target_freqs_hz(profiles).into_iter().enumerate() {
+                if stop.load(Ordering::Relaxed) {
+                    break;
+                }
+                let wait_started = Instant::now();
+                while pending >= 2 {
+                    pending -= 1;
+                    batches.push(self.receive(log, progress)?);
+                }
+                if stop.load(Ordering::Relaxed) {
+                    break;
+                }
+                let queue_wait_ms = wait_started.elapsed().as_secs_f64() * 1000.0;
+                let source_name = backend.source_name().to_string();
+                let settings = backend.scan_config();
+                let gain = backend
+                    .gain_label()
+                    .map(|value| format!(" gain={value}"))
+                    .unwrap_or_default();
+                log(format!(
+                    "{source_name} scan: tune={} dwell={} ms fft={}{}",
+                    format_frequency_hz(target_hz),
+                    settings.dwell_ms,
+                    settings.fft_size,
+                    gain
+                ));
+                let tune_started = Instant::now();
+                let center_hz = backend.tune(target_hz.round()).with_context(|| {
+                    format!("failed to tune {source_name} to {target_hz:.0} Hz")
+                })?;
+                let tune_ms = tune_started.elapsed().as_secs_f64() * 1000.0;
+                let settle_started = Instant::now();
+                backend.settle(stop)?;
+                let settle_ms = settle_started.elapsed().as_secs_f64() * 1000.0;
+                if stop.load(Ordering::Relaxed) {
+                    break;
+                }
+                let capture = backend.capture(stop).with_context(|| {
+                    format!(
+                        "failed while collecting {source_name} samples at {}",
+                        format_frequency_hz(target_hz)
+                    )
+                })?;
+                if capture.statistics.interrupted || stop.load(Ordering::Relaxed) {
+                    break;
+                }
+                let stats = capture.statistics;
+                let statistics = TargetStatistics {
+                    source: source_name.clone(),
+                    target_hz,
+                    actual_center_hz: center_hz,
+                    tune_ms,
+                    settle_ms: settle_ms + stats.settle_ms,
+                    conversion_ms: stats.conversion_ms,
+                    iq_samples: capture.iq.len(),
+                    queue_wait_ms,
+                    fft_frames: capture.iq.len() / settings.fft_size.max(1),
+                    capture_ms: stats.capture_ms,
+                    raw_bytes: stats.raw_bytes,
+                    timeouts: stats.timeouts,
+                    overflows: stats.overflows,
+                    discarded_iq_samples: stats.discarded_iq_samples,
+                    interrupted: stats.interrupted,
+                    ..Default::default()
+                };
+                let record = scan.record_path.is_some() && scan.record_mode != RecordMode::Peaks;
+                let settings = SpectrumSettings {
+                    sample_rate_hz: settings.sample_rate_hz,
+                    fft_size: settings.fft_size,
+                    search_window_hz: scan.peak_search_window_hz,
+                    dc_notch_hz: settings.dc_notch_hz,
+                    min_peak_snr_db: scan.min_peak_snr_db,
+                    max_peaks: scan.max_peaks_per_freq,
+                    spectrum_window_bins: if record && scan.record_mode == RecordMode::Spectrum {
+                        scan.record_spectrum_bins
+                    } else {
+                        0
+                    },
+                    band_decimation: if !record {
+                        0
+                    } else if scan.record_mode == RecordMode::Summary {
+                        usize::MAX
+                    } else {
+                        scan.record_band_decimation.max(1)
+                    },
+                };
+                self.sender
+                    .as_ref()
+                    .ok_or_else(|| anyhow!("SDR analysis worker stopped"))?
+                    .send(AnalysisTask {
+                        sequence,
+                        source_name,
+                        target_hz,
+                        center_hz,
+                        iq: capture.iq,
+                        settings,
+                        statistics,
+                    })
+                    .map_err(|_| anyhow!("SDR analysis worker stopped"))?;
+                pending += 1;
+            }
+            Ok(())
+        })();
+        let mut analysis_error = None;
+        for _ in 0..pending {
+            match self.receive(log, progress) {
+                Ok(result) => batches.push(result),
+                Err(error) => {
+                    analysis_error.get_or_insert(error);
+                }
+            }
+        }
+        capture_result?;
+        if let Some(error) = analysis_error {
+            return Err(error);
+        }
+        batches.sort_by_key(|batch| batch.sequence);
+        let mut output = SdrScanOutput::default();
+        for batch in batches {
+            if let Some(mut band) = batch.band {
+                band.source = Some(batch.source_name.clone());
+                output.spectrum_bands.push(band);
+            }
+            for candidate in batch.candidates {
+                output
+                    .peaks
+                    .push(candidate.into_peak(output.peaks.len() + 1, batch.source_name.clone()));
+            }
+            output.statistics.push(batch.statistics);
+        }
+        Ok(output)
+    }
+
+    fn receive(
+        &self,
+        log: &mut dyn FnMut(String),
+        progress: &mut dyn FnMut(&TargetStatistics),
+    ) -> Result<AnalysisResult> {
+        let result = self
+            .receiver
+            .recv()
+            .map_err(|_| anyhow!("SDR analysis worker stopped before returning results"))??;
+        log(format!(
+            "{} peaks: target={} count={} samples={} frames={} capture={:.1} ms analysis={:.1} ms",
+            result.source_name,
+            format_frequency_hz(result.target_hz),
+            result.candidates.len(),
+            result.statistics.iq_samples,
+            result.statistics.fft_frames,
+            result.statistics.capture_ms,
+            result.statistics.analysis_ms
+        ));
+        progress(&result.statistics);
+        Ok(result)
+    }
+}
+
+impl Drop for SdrPipeline {
+    fn drop(&mut self) {
+        self.sender.take();
+        if let Some(worker) = self.worker.take() {
+            let _ = worker.join();
+        }
+    }
 }
 
 struct AnalysisTask {
@@ -214,7 +384,8 @@ struct AnalysisTask {
     target_hz: f64,
     center_hz: f64,
     iq: Vec<Complex32>,
-    spectrum_settings: SpectrumSettings,
+    settings: SpectrumSettings,
+    statistics: TargetStatistics,
 }
 
 struct AnalysisResult {
@@ -223,6 +394,18 @@ struct AnalysisResult {
     target_hz: f64,
     candidates: Vec<PeakCandidate>,
     band: Option<SpectrumBand>,
+    statistics: TargetStatistics,
+}
+
+pub fn interruptible_sleep(duration: Duration, stop: &Arc<AtomicBool>) {
+    let deadline = Instant::now() + duration;
+    while !stop.load(Ordering::Relaxed) {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            break;
+        }
+        thread::sleep(remaining.min(Duration::from_millis(10)));
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -233,6 +416,10 @@ pub struct AirspySettings {
     pub sample_rate_hz: u32,
     #[serde(default = "default_dwell_ms")]
     pub dwell_ms: u64,
+    #[serde(default)]
+    pub fft_frames: Option<usize>,
+    #[serde(default = "default_capture_timeout_ms")]
+    pub capture_timeout_ms: u64,
     #[serde(default = "default_fft_size")]
     pub fft_size: usize,
     #[serde(default = "default_dc_notch_hz")]
@@ -250,6 +437,15 @@ impl Default for AirspySettings {
 }
 
 impl AirspySettings {
+    pub fn validate(&self) -> Result<()> {
+        validate_capture_budget(
+            self.sample_rate_hz,
+            self.fft_size,
+            self.fft_frames,
+            self.capture_timeout_ms,
+        )
+    }
+
     pub fn scan_config(&self) -> SdrScanConfig {
         SdrScanConfig {
             sample_rate_hz: self.sample_rate_hz as f64,
@@ -297,6 +493,10 @@ pub struct SoapySettings {
     pub sample_rate_hz: u32,
     #[serde(default = "default_soapy_dwell_ms")]
     pub dwell_ms: u64,
+    #[serde(default)]
+    pub fft_frames: Option<usize>,
+    #[serde(default = "default_capture_timeout_ms")]
+    pub capture_timeout_ms: u64,
     #[serde(default = "default_soapy_fft_size")]
     pub fft_size: usize,
     #[serde(default = "default_soapy_dc_notch_hz")]
@@ -318,6 +518,15 @@ impl Default for SoapySettings {
 }
 
 impl SoapySettings {
+    pub fn validate(&self) -> Result<()> {
+        validate_capture_budget(
+            self.sample_rate_hz,
+            self.fft_size,
+            self.fft_frames,
+            self.capture_timeout_ms,
+        )
+    }
+
     pub fn scan_config(&self, sample_rate_hz: f64) -> SdrScanConfig {
         SdrScanConfig {
             sample_rate_hz,
@@ -349,6 +558,39 @@ impl Default for SoapyGainSettings {
 pub struct SoapyGainElement {
     pub name: String,
     pub gain_db: f64,
+}
+
+fn validate_capture_budget(
+    sample_rate_hz: u32,
+    fft_size: usize,
+    fft_frames: Option<usize>,
+    timeout_ms: u64,
+) -> Result<()> {
+    anyhow::ensure!(sample_rate_hz > 0, "sample_rate_hz must be positive");
+    anyhow::ensure!(
+        fft_size > 0 && fft_size.is_power_of_two() && fft_size <= 1_048_576,
+        "fft_size must be a power of two between 1 and 1048576"
+    );
+    anyhow::ensure!(timeout_ms > 0, "capture_timeout_ms must be positive");
+    if let Some(frames) = fft_frames {
+        anyhow::ensure!(frames > 0, "fft_frames must be positive");
+        let samples = frames
+            .checked_mul(fft_size)
+            .ok_or_else(|| anyhow!("FFT capture budget is too large"))?;
+        anyhow::ensure!(
+            samples <= 16_777_216,
+            "FFT capture budget exceeds 16777216 IQ samples"
+        );
+        anyhow::ensure!(
+            samples as f64 / sample_rate_hz as f64 * 1000.0 < timeout_ms as f64,
+            "capture_timeout_ms must exceed the FFT sample budget duration"
+        );
+    }
+    Ok(())
+}
+
+fn default_capture_timeout_ms() -> u64 {
+    3000
 }
 
 fn default_airspy_sample_rate() -> u32 {

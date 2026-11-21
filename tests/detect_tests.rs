@@ -270,3 +270,182 @@ fn exposes_weak_offset_candidates_for_tracking() {
     assert_eq!(candidates[0].hits, 1);
     assert!((candidates[0].offset_group_hz.unwrap() - 7_500.0).abs() < 100.0);
 }
+
+#[test]
+fn equal_offset_scores_keep_the_first_input_seed() {
+    let profile = profile(vec![840.0], OffsetModel::Auto, 1, 0.0, 100.0);
+    for peaks in [
+        vec![
+            peak(9, 840_005_000.0, -70.0, -90.0),
+            peak(2, 839_995_000.0, -70.0, -90.0),
+        ],
+        vec![
+            peak(2, 839_995_000.0, -70.0, -90.0),
+            peak(9, 840_005_000.0, -70.0, -90.0),
+        ],
+    ] {
+        let result = detect_profile(
+            &profile,
+            &peaks,
+            &MaskSet::default(),
+            &ScanSettings::default(),
+        );
+        assert_eq!(result.hit_details[0].peak_id, peaks[0].id);
+        assert!(matches!(
+            result.offset,
+            Some(OffsetEstimate::FixedHz { .. })
+        ));
+    }
+}
+
+#[test]
+fn identical_peak_matches_keep_the_last_input_peak() {
+    let profile = fixed_profile(3);
+    let peaks = vec![
+        peak(9, 840_012_500.0, -70.0, -90.0),
+        peak(1, 816_012_500.0, -70.0, -90.0),
+        peak(3, 864_012_500.0, -70.0, -90.0),
+        peak(2, 840_012_500.0, -70.0, -90.0),
+    ];
+    let result = detect_profile(
+        &profile,
+        &peaks,
+        &MaskSet::default(),
+        &ScanSettings::default(),
+    );
+    assert_eq!(
+        result
+            .hit_details
+            .iter()
+            .map(|hit| hit.peak_id)
+            .collect::<Vec<_>>(),
+        vec![1, 2, 3]
+    );
+    assert_eq!(result.score, 62.25);
+}
+
+#[test]
+fn dense_wide_scan_keeps_profile_order_and_masks_before_matching() {
+    let mut profiles = vec![fixed_profile(3), fixed_profile(3)];
+    profiles[0].name = "first".into();
+    profiles[1].name = "second".into();
+    profiles[1].freqs_mhz = vec![910.0, 934.0, 958.0];
+    let mut peaks = (0..4000)
+        .map(|i| peak(i + 100, 400_000_000.0 + i as f64 * 200_003.0, -89.0, -90.0))
+        .collect::<Vec<_>>();
+    peaks.extend([
+        peak(1, 958_008_000.0, -78.0, -90.0),
+        peak(2, 840_012_500.0, -70.0, -90.0),
+        peak(3, 816_012_500.0, -70.0, -90.0),
+        peak(4, 934_008_000.0, -78.0, -90.0),
+        peak(5, 864_012_500.0, -70.0, -90.0),
+        peak(6, 910_008_000.0, -78.0, -90.0),
+        peak(7, 816_012_600.0, -40.0, -90.0),
+    ]);
+    let masks = MaskSet::new(vec![FrequencyMask {
+        center_hz: 816_012_600.0,
+        width_hz: 10.0,
+        label: None,
+    }]);
+    let result =
+        camfinder::detect::detect_profiles(&profiles, &peaks, &masks, &ScanSettings::default());
+    let first = result
+        .iter()
+        .find(|candidate| candidate.profile == "first")
+        .unwrap();
+    let second = result
+        .iter()
+        .find(|candidate| candidate.profile == "second")
+        .unwrap();
+    assert_eq!(
+        first
+            .hit_details
+            .iter()
+            .map(|hit| hit.peak_id)
+            .collect::<Vec<_>>(),
+        vec![3, 2, 5]
+    );
+    assert_eq!(
+        second
+            .hit_details
+            .iter()
+            .map(|hit| hit.peak_id)
+            .collect::<Vec<_>>(),
+        vec![6, 4, 1]
+    );
+    assert_eq!(first.score, 62.25);
+    assert_eq!(second.score, 38.25);
+    assert_eq!(result[0].profile, "first");
+}
+
+#[test]
+fn seed_search_includes_both_window_boundaries() {
+    let profile = profile(vec![840.0], OffsetModel::FixedHz, 1, 0.0, 100.0);
+    let mut settings = ScanSettings::default();
+    settings.peak_search_window_hz = 10_000.0;
+    let peaks = vec![
+        peak(1, 840_010_101.0, -50.0, -90.0),
+        peak(2, 840_010_000.0, -70.0, -90.0),
+        peak(3, 839_990_000.0, -70.0, -90.0),
+        peak(4, 839_989_899.0, -50.0, -90.0),
+    ];
+    let result = detect_profile_candidates(&[profile], &peaks, &MaskSet::default(), &settings);
+    assert_eq!(result.len(), 2);
+    assert!(result.iter().all(|candidate| candidate.detected));
+    assert!(result
+        .iter()
+        .any(|candidate| candidate.hit_details[0].peak_id == 2));
+    assert!(result
+        .iter()
+        .any(|candidate| candidate.hit_details[0].peak_id == 3));
+}
+
+#[test]
+fn symmetric_residual_ties_follow_input_order_before_refitting() {
+    let profile = fixed_profile(3);
+    let peaks = vec![
+        peak(1, 816_012_500.0, -70.0, -90.0),
+        peak(2, 840_013_000.0, -70.0, -90.0),
+        peak(3, 864_012_500.0, -70.0, -90.0),
+        peak(4, 840_012_000.0, -70.0, -90.0),
+    ];
+    let result = detect_profile(
+        &profile,
+        &peaks,
+        &MaskSet::default(),
+        &ScanSettings::default(),
+    );
+    assert_eq!(
+        result
+            .hit_details
+            .iter()
+            .map(|hit| hit.peak_id)
+            .collect::<Vec<_>>(),
+        vec![1, 4, 3]
+    );
+    assert!((result.offset_group_hz.unwrap() - 12_333.333333333334).abs() < 1e-6);
+}
+
+#[test]
+fn matching_tolerance_includes_both_boundaries_and_excludes_just_outside() {
+    let profile = fixed_profile(3);
+    for (upper, lower, expected_hits) in [
+        (1_000.0, -1_000.0, 3),
+        (1_000.125, -1_000.0, 2),
+        (1_000.0, -1_000.125, 2),
+    ] {
+        let peaks = vec![
+            peak(1, 816_000_000.0, -70.0, -90.0),
+            peak(2, 840_000_000.0 + upper, -70.0, -90.0),
+            peak(3, 864_000_000.0 + lower, -70.0, -90.0),
+        ];
+        let result = detect_profile(
+            &profile,
+            &peaks,
+            &MaskSet::default(),
+            &ScanSettings::default(),
+        );
+        assert_eq!(result.hits, expected_hits);
+        assert_eq!(result.detected, expected_hits == 3);
+    }
+}

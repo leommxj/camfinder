@@ -58,10 +58,15 @@ mod real {
     use super::SoapyDeviceInfo;
     use crate::dsp::Complex32;
     use crate::sdr::{
-        IqBackend, SdrScanConfig, SoapyGainElement, SoapyGainSettings, SoapySettings,
+        CaptureStatistics, IqBackend, IqCapture, SdrScanConfig, SoapyGainElement,
+        SoapyGainSettings, SoapySettings,
     };
     use anyhow::{anyhow, Context, Result};
     use soapysdr::{Device, Direction, ErrorCode, RxStream};
+    use std::sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    };
     use std::time::{Duration, Instant};
 
     pub fn list_soapy_devices(filter: &str) -> Result<Vec<SoapyDeviceInfo>> {
@@ -86,6 +91,7 @@ mod real {
 
     impl SoapyScanner {
         pub fn open(settings: SoapySettings) -> Result<Self> {
+            settings.validate()?;
             let selected_args = select_device_args(&settings)?;
             let device = Device::new(selected_args.as_str())
                 .with_context(|| format!("failed to open SoapySDR device '{selected_args}'"))?;
@@ -125,7 +131,16 @@ mod real {
         }
 
         fn collect_iq(&mut self) -> Result<Vec<Complex32>> {
-            collect_iq(&mut self.stream, &self.settings, self.actual_sample_rate_hz)
+            Ok(self.capture(&Arc::new(AtomicBool::new(false)))?.iq)
+        }
+
+        fn capture(&mut self, stop: &Arc<AtomicBool>) -> Result<IqCapture> {
+            collect_iq(
+                &mut self.stream,
+                &self.settings,
+                self.actual_sample_rate_hz,
+                stop,
+            )
         }
 
         fn gain_label(&self) -> Option<String> {
@@ -268,47 +283,94 @@ mod real {
         stream: &mut RxStream<Complex32>,
         settings: &SoapySettings,
         actual_sample_rate_hz: f64,
-    ) -> Result<Vec<Complex32>> {
-        let duration = Duration::from_millis(settings.dwell_ms);
-        let deadline = Instant::now() + duration;
+        stop: &Arc<AtomicBool>,
+    ) -> Result<IqCapture> {
+        let started = Instant::now();
+        let timeout_ms = if settings.fft_frames.is_some() {
+            settings.capture_timeout_ms
+        } else {
+            settings
+                .capture_timeout_ms
+                .max(settings.dwell_ms.saturating_add(250))
+        };
+        let deadline = started + Duration::from_millis(timeout_ms);
+        let dwell_deadline = started + Duration::from_millis(settings.dwell_ms);
         let mtu = stream.mtu().unwrap_or(16_384).max(1024);
-        let mut buffer = vec![Complex32::new(0.0, 0.0); mtu];
-        let expected_len =
-            ((actual_sample_rate_hz * settings.dwell_ms as f64) / 1000.0).ceil() as usize;
+        anyhow::ensure!(
+            actual_sample_rate_hz.is_finite() && actual_sample_rate_hz > 0.0,
+            "SoapySDR returned an invalid sample rate"
+        );
+        let read_size = ((actual_sample_rate_hz * 0.01).ceil() as usize).clamp(1, mtu);
+        let mut buffer = vec![Complex32::new(0.0, 0.0); read_size];
+        let target_samples = settings
+            .fft_frames
+            .map(|frames| frames.saturating_mul(settings.fft_size));
+        let expected_len = target_samples.unwrap_or_else(|| {
+            ((actual_sample_rate_hz * settings.dwell_ms as f64) / 1000.0).ceil() as usize
+        });
         let mut iq = Vec::with_capacity(expected_len.max(settings.fft_size));
+        let mut statistics = CaptureStatistics::default();
         let mut chunks_to_discard = 2usize;
-
         stream
             .activate(None)
             .context("failed to activate SoapySDR RX stream")?;
-        let result = (|| -> Result<Vec<Complex32>> {
-            while Instant::now() < deadline {
-                match stream.read(&mut [&mut buffer[..]], 1_500_000) {
+        let result = (|| -> Result<()> {
+            loop {
+                if stop.load(Ordering::Relaxed) {
+                    statistics.interrupted = true;
+                    break;
+                }
+                if target_samples.is_some_and(|target| iq.len() >= target) {
+                    break;
+                }
+                if target_samples.is_none() && Instant::now() >= dwell_deadline {
+                    break;
+                }
+                if Instant::now() >= deadline {
+                    statistics.timeouts += 1;
+                    return Err(anyhow!(
+                        "SoapySDR capture timeout: {} IQ samples, {} timeout(s), {} overflow(s)",
+                        iq.len(),
+                        statistics.timeouts,
+                        statistics.overflows
+                    ));
+                }
+                match stream.read(&mut [&mut buffer[..]], 20_000) {
                     Ok(0) => {}
                     Ok(n) => {
+                        statistics.raw_bytes += (n * std::mem::size_of::<Complex32>()) as u64;
                         if chunks_to_discard > 0 {
                             chunks_to_discard -= 1;
+                            statistics.discarded_iq_samples += n;
                             continue;
                         }
-                        iq.extend_from_slice(&buffer[..n]);
+                        let count = target_samples
+                            .map(|target| target.saturating_sub(iq.len()).min(n))
+                            .unwrap_or(n);
+                        statistics.discarded_iq_samples += n - count;
+                        iq.extend_from_slice(&buffer[..count]);
                     }
-                    Err(err) if matches!(err.code, ErrorCode::Timeout | ErrorCode::Overflow) => {}
-                    Err(err) => return Err(err.into()),
+                    Err(error) if error.code == ErrorCode::Timeout => {
+                        statistics.timeouts += 1;
+                    }
+                    Err(error) if error.code == ErrorCode::Overflow => {
+                        statistics.overflows += 1;
+                        return Err(anyhow!("SoapySDR RX overflow after {} IQ samples; discontinuous capture rejected ({} overflow(s))", iq.len(), statistics.overflows));
+                    }
+                    Err(error) => return Err(error.into()),
                 }
             }
-            Ok(iq)
+            Ok(())
         })();
         let deactivate_result = if stream.active() {
             stream.deactivate(None)
         } else {
             Ok(())
         };
-
-        match (result, deactivate_result) {
-            (Ok(iq), Ok(())) => Ok(iq),
-            (Err(err), _) => Err(err),
-            (Ok(_), Err(err)) => Err(err.into()),
-        }
+        result?;
+        deactivate_result?;
+        statistics.capture_ms = started.elapsed().as_secs_f64() * 1000.0;
+        Ok(IqCapture { iq, statistics })
     }
 
     fn gain_label(gain: &SoapyGainSettings) -> String {

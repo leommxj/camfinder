@@ -75,9 +75,11 @@ pub fn detect_profiles(
     masks: &MaskSet,
     settings: &ScanSettings,
 ) -> Vec<ProfileDetection> {
+    let peaks = PeakIndex::new(peaks, masks);
     profiles
         .iter()
-        .flat_map(|profile| detect_profile_suspects(profile, peaks, masks, settings))
+        .flat_map(|profile| detect_profile_candidate_offsets(profile, &peaks, settings))
+        .filter(|result| result.detected)
         .collect()
 }
 
@@ -87,10 +89,43 @@ pub fn detect_profile_candidates(
     masks: &MaskSet,
     settings: &ScanSettings,
 ) -> Vec<ProfileDetection> {
+    let peaks = PeakIndex::new(peaks, masks);
     profiles
         .iter()
-        .flat_map(|profile| detect_profile_candidate_offsets(profile, peaks, masks, settings))
+        .flat_map(|profile| detect_profile_candidate_offsets(profile, &peaks, settings))
         .collect()
+}
+
+struct IndexedPeak<'a> {
+    peak: &'a Peak,
+    input_index: usize,
+}
+
+struct PeakIndex<'a> {
+    peaks: Vec<IndexedPeak<'a>>,
+}
+
+impl<'a> PeakIndex<'a> {
+    fn new(peaks: &'a [Peak], masks: &MaskSet) -> Self {
+        let mut peaks = peaks
+            .iter()
+            .enumerate()
+            .filter(|(_, peak)| !peak.freq_hz.is_nan() && !masks.is_masked(peak.freq_hz))
+            .map(|(input_index, peak)| IndexedPeak { peak, input_index })
+            .collect::<Vec<_>>();
+        peaks.sort_by(|left, right| left.peak.freq_hz.total_cmp(&right.peak.freq_hz));
+        Self { peaks }
+    }
+
+    fn within(&self, expected_hz: f64, radius_hz: f64) -> &[IndexedPeak<'a>] {
+        let start = self
+            .peaks
+            .partition_point(|entry| entry.peak.freq_hz - expected_hz < -radius_hz);
+        let end = self
+            .peaks
+            .partition_point(|entry| entry.peak.freq_hz - expected_hz <= radius_hz);
+        &self.peaks[start.min(end)..end]
+    }
 }
 
 pub fn detect_profile(
@@ -100,8 +135,9 @@ pub fn detect_profile(
     settings: &ScanSettings,
 ) -> ProfileDetection {
     let mut best = None;
+    let peaks = PeakIndex::new(peaks, masks);
 
-    for evaluated in evaluate_profile_offsets(profile, peaks, masks, settings) {
+    for evaluated in evaluate_profile_offsets(profile, &peaks, settings) {
         best = choose_better(best, evaluated);
     }
 
@@ -116,7 +152,8 @@ pub fn detect_profile_suspects(
     masks: &MaskSet,
     settings: &ScanSettings,
 ) -> Vec<ProfileDetection> {
-    detect_profile_candidate_offsets(profile, peaks, masks, settings)
+    let peaks = PeakIndex::new(peaks, masks);
+    detect_profile_candidate_offsets(profile, &peaks, settings)
         .into_iter()
         .filter(|result| result.detected)
         .collect()
@@ -124,11 +161,10 @@ pub fn detect_profile_suspects(
 
 fn detect_profile_candidate_offsets(
     profile: &DetectionProfile,
-    peaks: &[Peak],
-    masks: &MaskSet,
+    peaks: &PeakIndex<'_>,
     settings: &ScanSettings,
 ) -> Vec<ProfileDetection> {
-    let mut evaluated = evaluate_profile_offsets(profile, peaks, masks, settings)
+    let mut evaluated = evaluate_profile_offsets(profile, peaks, settings)
         .into_iter()
         .filter(|result| !result.hit_details.is_empty())
         .collect::<Vec<_>>();
@@ -173,29 +209,35 @@ fn detect_profile_candidate_offsets(
 
 fn evaluate_profile_offsets(
     profile: &DetectionProfile,
-    peaks: &[Peak],
-    masks: &MaskSet,
+    peaks: &PeakIndex<'_>,
     settings: &ScanSettings,
 ) -> Vec<ProfileDetection> {
-    let active_peaks: Vec<&Peak> = peaks
-        .iter()
-        .filter(|peak| !masks.is_masked(peak.freq_hz))
-        .collect();
-
-    offset_seeds(profile, &active_peaks, settings.peak_search_window_hz)
-        .into_iter()
-        .map(|seed| evaluate_offset(profile, &active_peaks, seed))
-        .collect()
+    let nominal_freqs_hz = profile.nominal_freqs_hz();
+    offset_seeds(
+        profile,
+        peaks,
+        &nominal_freqs_hz,
+        settings.peak_search_window_hz,
+    )
+    .into_iter()
+    .map(|seed| evaluate_offset(profile, peaks, &nominal_freqs_hz, seed))
+    .collect()
 }
 
 fn offset_seeds(
     profile: &DetectionProfile,
-    peaks: &[&Peak],
+    peaks: &PeakIndex<'_>,
+    nominal_freqs_hz: &[f64],
     search_window_hz: f64,
 ) -> Vec<OffsetEstimate> {
     let mut seeds = Vec::new();
-    for nominal_hz in profile.nominal_freqs_hz() {
-        for peak in peaks {
+    let mut nearby = Vec::new();
+    for &nominal_hz in nominal_freqs_hz {
+        nearby.clear();
+        nearby.extend(peaks.within(nominal_hz, search_window_hz));
+        nearby.sort_unstable_by_key(|entry| entry.input_index);
+        for entry in &nearby {
+            let peak = entry.peak;
             if (peak.freq_hz - nominal_hz).abs() <= search_window_hz {
                 let offset_hz = peak.freq_hz - nominal_hz;
                 match profile.offset_model {
@@ -222,45 +264,51 @@ fn offset_seeds(
 
 fn evaluate_offset(
     profile: &DetectionProfile,
-    peaks: &[&Peak],
+    peaks: &PeakIndex<'_>,
+    nominal_freqs_hz: &[f64],
     offset: OffsetEstimate,
 ) -> ProfileDetection {
-    let initial = evaluate_offset_once(profile, peaks, offset);
+    let initial = evaluate_offset_once(profile, peaks, nominal_freqs_hz, offset);
     let Some(fitted_offset) = fitted_offset(initial.offset.unwrap_or(offset), &initial.hit_details)
     else {
         return initial;
     };
-    evaluate_offset_once(profile, peaks, fitted_offset)
+    evaluate_offset_once(profile, peaks, nominal_freqs_hz, fitted_offset)
 }
 
 fn evaluate_offset_once(
     profile: &DetectionProfile,
-    peaks: &[&Peak],
+    peaks: &PeakIndex<'_>,
+    nominal_freqs_hz: &[f64],
     offset: OffsetEstimate,
 ) -> ProfileDetection {
     let mut used_peak_ids = HashSet::new();
     let mut hit_details = Vec::new();
     let mut misses_mhz = Vec::new();
 
-    for nominal_hz in profile.nominal_freqs_hz() {
+    for &nominal_hz in nominal_freqs_hz {
         let expected_hz = offset.apply(nominal_hz);
         let best_peak = peaks
+            .within(expected_hz, profile.max_offset_spread_hz)
             .iter()
-            .filter(|peak| !used_peak_ids.contains(&peak.id))
-            .filter_map(|peak| {
+            .filter(|entry| !used_peak_ids.contains(&entry.peak.id))
+            .filter_map(|entry| {
+                let peak = entry.peak;
                 let error_hz = peak.freq_hz - expected_hz;
                 if error_hz.abs() <= profile.max_offset_spread_hz {
                     Some((
-                        *peak,
+                        peak,
                         error_hz,
                         peak_match_score(peak, error_hz, profile.max_offset_spread_hz),
+                        entry.input_index,
                     ))
                 } else {
                     None
                 }
             })
             .max_by(
-                |(left_peak, left_error, left_score), (right_peak, right_error, right_score)| {
+                |(left_peak, left_error, left_score, left_index),
+                 (right_peak, right_error, right_score, right_index)| {
                     left_score
                         .partial_cmp(right_score)
                         .unwrap_or(std::cmp::Ordering::Equal)
@@ -276,10 +324,11 @@ fn evaluate_offset_once(
                                 .partial_cmp(&right_peak.snr_db())
                                 .unwrap_or(std::cmp::Ordering::Equal)
                         })
+                        .then_with(|| left_index.cmp(right_index))
                 },
             );
 
-        if let Some((peak, error_hz, _)) = best_peak {
+        if let Some((peak, error_hz, _, _)) = best_peak {
             used_peak_ids.insert(peak.id);
             hit_details.push(DetectionHit {
                 nominal_mhz: nominal_hz / MHZ,

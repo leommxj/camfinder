@@ -1,30 +1,31 @@
 use anyhow::{anyhow, Result};
-use camfinder::airspy_backend::{list_airspy_devices, AirspyScanner};
-use camfinder::config::{AppConfig, DetectionProfile, OffsetModel};
-use camfinder::detect::{detect_profile_candidates, OffsetEstimate, ProfileDetection};
+#[cfg(feature = "airspy")]
+use camfinder::airspy_backend::list_airspy_devices;
+use camfinder::config::{AppConfig, DetectionProfile, OffsetModel, RecordMode};
+use camfinder::detect::{OffsetEstimate, ProfileDetection};
+use camfinder::engine::{EngineConfig, ScanEngine};
 use camfinder::frequency::{
     format_frequency_hz, format_offset_hz, parse_frequency_hz, parse_frequency_list_mhz,
 };
 use camfinder::mask::{parse_mask_spec, MaskSet};
-use camfinder::peak::{Peak, SpectrumBand};
-use camfinder::persistence::{PersistenceSummary, PersistenceTracker, StabilityState};
+use camfinder::peak::Peak;
+use camfinder::persistence::{PersistenceSummary, StabilityState};
 use camfinder::sdr::{
-    scan_sdr, AirspySettings, DeviceSettings, IqBackend, SoapyGainElement, SoapySettings,
+    AirspySettings, DeviceSettings, SoapyGainElement, SoapySettings, TargetStatistics,
 };
-use camfinder::soapy_backend::{list_soapy_devices, SoapyScanner};
-use camfinder::synthetic::{generate_peaks, SyntheticInterferer, SyntheticOptions};
+use camfinder::soapy_backend::list_soapy_devices;
+use camfinder::synthetic::{SyntheticInterferer, SyntheticOptions};
 use camfinder::timeparse::{format_duration, parse_duration};
 use camfinder::tui::{run_tui_loop, TuiScanSnapshot};
 use clap::{ArgAction, Parser, Subcommand, ValueEnum};
-use serde::Deserialize;
+use serde::Serialize;
 use std::collections::VecDeque;
-use std::fs::{self, OpenOptions};
-use std::io::{self, IsTerminal, Write};
-use std::path::{Path, PathBuf};
+use std::io::{self, IsTerminal};
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc};
 use std::thread;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 
 #[derive(Debug, Parser)]
 #[command(name = "camfinder")]
@@ -49,6 +50,7 @@ enum Commands {
 enum BackendArg {
     Synthetic,
     PeaksFile,
+    IqFile,
     Airspy,
     Soapy,
 }
@@ -58,6 +60,23 @@ enum OutputArg {
     Tui,
     Table,
     Json,
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum RecordModeArg {
+    Peaks,
+    Summary,
+    Spectrum,
+}
+
+impl From<RecordModeArg> for RecordMode {
+    fn from(value: RecordModeArg) -> Self {
+        match value {
+            RecordModeArg::Peaks => Self::Peaks,
+            RecordModeArg::Summary => Self::Summary,
+            RecordModeArg::Spectrum => Self::Spectrum,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
@@ -84,6 +103,8 @@ struct ScanArgs {
     backend: Option<BackendArg>,
     #[arg(long)]
     peaks_file: Option<PathBuf>,
+    #[arg(long)]
+    iq_file: Option<PathBuf>,
     #[arg(long, value_name = "PATH")]
     profile: Option<PathBuf>,
     #[arg(long)]
@@ -104,6 +125,10 @@ struct ScanArgs {
     max_peaks: Option<usize>,
     #[arg(long)]
     record: Option<PathBuf>,
+    #[arg(long, value_enum)]
+    record_mode: Option<RecordModeArg>,
+    #[arg(long)]
+    record_only: bool,
     #[arg(long)]
     record_spectrum_bins: Option<usize>,
     #[arg(long)]
@@ -126,6 +151,10 @@ struct ScanArgs {
     mask: Vec<String>,
     #[arg(long)]
     dwell_ms: Option<u64>,
+    #[arg(long, conflicts_with_all = ["dwell_ms", "airspy_dwell_ms", "soapy_dwell_ms"])]
+    fft_frames: Option<usize>,
+    #[arg(long)]
+    capture_timeout_ms: Option<u64>,
     #[arg(long)]
     settle_ms: Option<u64>,
     #[arg(long, default_value = "+12.5k")]
@@ -204,9 +233,19 @@ struct ScanArgs {
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
+    if matches!(cli.command, Commands::Devices) {
+        return print_devices();
+    }
+    if matches!(cli.command, Commands::DefaultConfig) {
+        print!("{}", AppConfig::default_toml());
+        return Ok(());
+    }
     let config = match &cli.config {
         Some(path) => AppConfig::load(path)?,
-        None => AppConfig::default(),
+        None if matches!(&cli.command, Commands::Scan(args) if args.profile.is_some() || args.profile_freqs.is_some()) => {
+            toml::from_str(AppConfig::default_toml())?
+        }
+        None => AppConfig::load_defaults()?,
     };
 
     match cli.command {
@@ -276,24 +315,31 @@ fn run_scan(mut config: AppConfig, args: ScanArgs) -> Result<()> {
     let repeat_delay = parse_duration(&args.repeat_delay)?;
     let repeat = should_repeat(&args, backend);
     let output = resolve_output(resolve_output_arg(&config, &args)?);
-    let stop = setup_stop_flag(repeat)?;
-    let mut source = build_scan_source(&active_device, backend)?;
-    let mut tracker = PersistenceTracker::new(args.confirm_passes, args.confirm_ratio);
+    let stop = setup_stop_flag(true)?;
+    let mut engine = ScanEngine::new(EngineConfig {
+        profiles: profiles.clone(),
+        device: active_device,
+        scan: config.scan.clone(),
+        masks: masks.masks().to_vec(),
+        confirm_passes: args.confirm_passes,
+        confirm_ratio: args.confirm_ratio,
+        record_only: args.record_only,
+        synthetic: synthetic_options(&args)?,
+    })?;
     let mut logs = VecDeque::new();
     push_log(
         &mut logs,
-        format!(
-            "scan started backend={:?} repeat={} search_window={}",
-            backend,
-            repeat,
-            format_frequency_hz(config.scan.peak_search_window_hz)
-        ),
+        format!("scan started backend={}", backend_config_name(backend)),
     );
     let started_at = Instant::now();
     let (tui_sender, tui_handle) = if matches!(output, OutputArg::Tui) {
-        let (sender, receiver) = mpsc::channel();
+        let (sender, receiver) = mpsc::sync_channel(1);
         let tui_stop = Arc::clone(&stop);
-        let handle = thread::spawn(move || run_tui_loop(receiver, tui_stop));
+        let handle = thread::spawn(move || {
+            let result = run_tui_loop(receiver, Arc::clone(&tui_stop));
+            tui_stop.store(true, Ordering::Relaxed);
+            result
+        });
         (Some(sender), Some(handle))
     } else {
         (None, None)
@@ -310,190 +356,165 @@ fn run_scan(mut config: AppConfig, args: ScanArgs) -> Result<()> {
             logs: logs.clone(),
         },
     );
-
     let deadline = duration.map(|duration| started_at + duration);
-    let mut pass = 0usize;
+    let mut pass = 0;
     let mut final_summaries = Vec::new();
-
-    loop {
-        if pass > 0 && deadline.is_some_and(|deadline| Instant::now() >= deadline) {
-            break;
-        }
-        if stop.load(Ordering::Relaxed) {
-            break;
-        }
-
-        pass += 1;
-        let pass_started = Instant::now();
-        push_log(&mut logs, format!("pass #{pass} started"));
-        let ScanPassData {
-            peaks,
-            spectrum_bands,
-        } = collect_pass_data(&mut source, &profiles, &config.scan, &args, &mut logs)?;
-        let candidates = detect_profile_candidates(&profiles, &peaks, &masks, &config.scan);
-        let results = candidates
-            .iter()
-            .filter(|result| result.detected)
-            .cloned()
-            .collect::<Vec<_>>();
-        tracker.update(&candidates);
-        final_summaries = tracker.summaries();
-        record_scan_pass(RecordScanPass {
-            config: &config,
-            backend,
-            pass,
-            elapsed: started_at.elapsed(),
-            pass_duration: pass_started.elapsed(),
-            device: &active_device,
-            profiles: &profiles,
-            masks: &masks,
-            peaks: &peaks,
-            spectrum_bands: &spectrum_bands,
-            results: &candidates,
-            summaries: &final_summaries,
-        })?;
-        push_log(
-            &mut logs,
-            format!(
-                "pass #{pass} finished peaks={} elapsed={}",
-                peaks.len(),
-                format_duration(pass_started.elapsed())
-            ),
-        );
-
-        match output {
-            OutputArg::Tui => {
-                send_tui_snapshot(
-                    &tui_sender,
-                    TuiScanSnapshot {
-                        pass,
-                        elapsed: started_at.elapsed(),
-                        pass_duration: pass_started.elapsed(),
-                        peaks: peaks.clone(),
-                        results: candidates.clone(),
-                        summaries: final_summaries.clone(),
-                        logs: logs.clone(),
-                    },
-                );
+    let scan_result = (|| -> Result<()> {
+        loop {
+            if stop.load(Ordering::Relaxed)
+                || (pass > 0 && deadline.is_some_and(|deadline| Instant::now() >= deadline))
+            {
+                break;
             }
-            OutputArg::Table if repeat => print_scan_pass_table(
-                pass,
-                started_at.elapsed(),
-                pass_started.elapsed(),
-                &peaks,
-                &candidates,
-                &final_summaries,
-            )?,
-            OutputArg::Table => print_scan_table(&profiles, &peaks, &masks, &results)?,
-            OutputArg::Json if repeat => {
-                let payload = serde_json::json!({
-                    "type": "scan_pass",
-                    "pass": pass,
-                    "elapsed_seconds": started_at.elapsed().as_secs_f64(),
-                    "pass_seconds": pass_started.elapsed().as_secs_f64(),
-                    "profiles": profiles,
-                    "masks": masks.masks(),
-                    "peaks": peaks,
-                    "results": results,
-                    "persistence": final_summaries,
-                });
-                println!("{}", serde_json::to_string(&payload)?);
+            let Some(data) =
+                engine.scan(&stop, &mut |line| push_log(&mut logs, line), &mut |_| {})?
+            else {
+                break;
+            };
+            pass = data.pass;
+            let pass_duration = Duration::from_secs_f64(data.pass_seconds);
+            let results: Vec<_> = data
+                .results
+                .iter()
+                .filter(|result| result.detected)
+                .cloned()
+                .collect();
+            final_summaries = data.persistence;
+            push_log(
+                &mut logs,
+                format!(
+                    "pass #{pass} finished peaks={} elapsed={}",
+                    data.peaks.len(),
+                    format_duration(pass_duration)
+                ),
+            );
+            match output {
+                OutputArg::Tui => {
+                    let mut peaks = data.peaks;
+                    for peak in &mut peaks {
+                        peak.spectrum_window.clear();
+                    }
+                    send_tui_snapshot(
+                        &tui_sender,
+                        TuiScanSnapshot {
+                            pass,
+                            elapsed: started_at.elapsed(),
+                            pass_duration,
+                            peaks,
+                            results: data.results,
+                            summaries: final_summaries.clone(),
+                            logs: logs.clone(),
+                        },
+                    );
+                }
+                OutputArg::Table if repeat => print_scan_pass_table(
+                    pass,
+                    started_at.elapsed(),
+                    pass_duration,
+                    &data.peaks,
+                    &data.results,
+                    &final_summaries,
+                )?,
+                OutputArg::Table => print_scan_table(&profiles, &data.peaks, &masks, &results)?,
+                OutputArg::Json if repeat => {
+                    serde_json::to_writer(
+                        io::stdout().lock(),
+                        &JsonPass {
+                            kind: "scan_pass",
+                            pass,
+                            elapsed_seconds: started_at.elapsed().as_secs_f64(),
+                            pass_seconds: data.pass_seconds,
+                            profiles: &profiles,
+                            masks: masks.masks(),
+                            peaks: &data.peaks,
+                            results: &results,
+                            persistence: &final_summaries,
+                            statistics: &data.statistics,
+                            matching_ms: data.matching_ms,
+                            recording_ms: data.recording_ms,
+                        },
+                    )?;
+                    println!();
+                }
+                OutputArg::Json => {
+                    serde_json::to_writer_pretty(
+                        io::stdout().lock(),
+                        &JsonResult {
+                            profiles: &profiles,
+                            masks: masks.masks(),
+                            peaks: &data.peaks,
+                            results: &results,
+                            statistics: &data.statistics,
+                        },
+                    )?;
+                    println!();
+                }
             }
-            OutputArg::Json => {
-                let payload = serde_json::json!({
-                    "profiles": profiles,
-                    "masks": masks.masks(),
-                    "peaks": peaks,
-                    "results": results,
-                });
-                println!("{}", serde_json::to_string_pretty(&payload)?);
+            if !repeat {
+                break;
             }
+            sleep_interruptible(repeat_delay, deadline, &stop);
         }
-
-        if !repeat {
-            break;
-        }
-        if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
-            break;
-        }
-        sleep_interruptible(repeat_delay, deadline, &stop);
-    }
-
+        Ok(())
+    })();
+    drop(engine);
     drop(tui_sender);
     if let Some(handle) = tui_handle {
-        match handle.join() {
-            Ok(result) => result?,
-            Err(_) => return Err(anyhow!("TUI thread panicked")),
-        }
+        handle
+            .join()
+            .map_err(|_| anyhow!("TUI thread panicked"))??;
     }
-
+    scan_result?;
     if repeat && matches!(output, OutputArg::Table | OutputArg::Tui) {
         print_final_persistence_table(started_at.elapsed(), pass, &final_summaries)?;
     } else if repeat && matches!(output, OutputArg::Json) {
-        let payload = serde_json::json!({
-            "type": "scan_final",
-            "elapsed_seconds": started_at.elapsed().as_secs_f64(),
-            "passes": pass,
-            "persistence": final_summaries,
-        });
-        println!("{}", serde_json::to_string(&payload)?);
+        serde_json::to_writer(
+            io::stdout().lock(),
+            &JsonFinal {
+                kind: "scan_final",
+                elapsed_seconds: started_at.elapsed().as_secs_f64(),
+                passes: pass,
+                persistence: &final_summaries,
+            },
+        )?;
+        println!();
     }
-
     Ok(())
 }
 
-struct RecordScanPass<'a> {
-    config: &'a AppConfig,
-    backend: BackendArg,
+#[derive(Serialize)]
+struct JsonPass<'a> {
+    #[serde(rename = "type")]
+    kind: &'static str,
     pass: usize,
-    elapsed: Duration,
-    pass_duration: Duration,
-    device: &'a DeviceSettings,
+    elapsed_seconds: f64,
+    pass_seconds: f64,
     profiles: &'a [DetectionProfile],
-    masks: &'a MaskSet,
+    masks: &'a [camfinder::mask::FrequencyMask],
     peaks: &'a [Peak],
-    spectrum_bands: &'a [SpectrumBand],
     results: &'a [ProfileDetection],
-    summaries: &'a [PersistenceSummary],
+    persistence: &'a [PersistenceSummary],
+    statistics: &'a [TargetStatistics],
+    matching_ms: f64,
+    recording_ms: f64,
 }
 
-fn record_scan_pass(record: RecordScanPass<'_>) -> Result<()> {
-    let Some(path) = &record.config.scan.record_path else {
-        return Ok(());
-    };
+#[derive(Serialize)]
+struct JsonResult<'a> {
+    profiles: &'a [DetectionProfile],
+    masks: &'a [camfinder::mask::FrequencyMask],
+    peaks: &'a [Peak],
+    results: &'a [ProfileDetection],
+    statistics: &'a [TargetStatistics],
+}
 
-    if let Some(parent) = path
-        .parent()
-        .filter(|parent| !parent.as_os_str().is_empty())
-    {
-        fs::create_dir_all(parent)?;
-    }
-
-    let now_unix_seconds = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|duration| duration.as_secs_f64())
-        .unwrap_or_default();
-    let payload = serde_json::json!({
-        "type": "scan_pass",
-        "format_version": 3,
-        "timestamp_unix_seconds": now_unix_seconds,
-        "backend": backend_config_name(record.backend),
-        "pass": record.pass,
-        "elapsed_seconds": record.elapsed.as_secs_f64(),
-        "pass_seconds": record.pass_duration.as_secs_f64(),
-        "scan": record.config.scan,
-        "device": record.device,
-        "profiles": record.profiles,
-        "masks": record.masks.masks(),
-        "peaks": record.peaks,
-        "spectrum_bands": record.spectrum_bands,
-        "results": record.results,
-        "persistence": record.summaries,
-    });
-
-    let mut file = OpenOptions::new().create(true).append(true).open(path)?;
-    writeln!(file, "{}", serde_json::to_string(&payload)?)?;
-    Ok(())
+#[derive(Serialize)]
+struct JsonFinal<'a> {
+    #[serde(rename = "type")]
+    kind: &'static str,
+    elapsed_seconds: f64,
+    passes: usize,
+    persistence: &'a [PersistenceSummary],
 }
 
 fn resolve_output(requested: OutputArg) -> OutputArg {
@@ -502,12 +523,6 @@ fn resolve_output(requested: OutputArg) -> OutputArg {
     } else {
         requested
     }
-}
-
-enum ScanSource {
-    Synthetic,
-    PeaksFile(PathBuf),
-    Sdr(Box<dyn IqBackend>),
 }
 
 fn should_repeat(args: &ScanArgs, backend: BackendArg) -> bool {
@@ -531,29 +546,6 @@ fn setup_stop_flag(enabled: bool) -> Result<Arc<AtomicBool>> {
     Ok(stop)
 }
 
-fn build_scan_source(device: &DeviceSettings, backend: BackendArg) -> Result<ScanSource> {
-    match backend {
-        BackendArg::Synthetic => Ok(ScanSource::Synthetic),
-        BackendArg::PeaksFile => {
-            let path = device
-                .peaks_file
-                .path
-                .as_ref()
-                .map(|path| path.to_path_buf())
-                .ok_or_else(|| {
-                    anyhow!("backend peaks-file requires --peaks-file or [device.peaks_file].path")
-                })?;
-            Ok(ScanSource::PeaksFile(path))
-        }
-        BackendArg::Airspy => Ok(ScanSource::Sdr(Box::new(AirspyScanner::open(
-            device.airspy.clone(),
-        )?))),
-        BackendArg::Soapy => Ok(ScanSource::Sdr(Box::new(SoapyScanner::open(
-            device.soapy.clone(),
-        )?))),
-    }
-}
-
 fn active_device_settings(
     base: &DeviceSettings,
     args: &ScanArgs,
@@ -567,6 +559,11 @@ fn active_device_settings(
         BackendArg::PeaksFile => {
             if let Some(path) = &args.peaks_file {
                 device.peaks_file.path = Some(path.clone());
+            }
+        }
+        BackendArg::IqFile => {
+            if let Some(path) = &args.iq_file {
+                device.replay.manifest = Some(path.clone());
             }
         }
         BackendArg::Airspy => {
@@ -584,6 +581,7 @@ fn backend_config_name(backend: BackendArg) -> &'static str {
     match backend {
         BackendArg::Synthetic => "synthetic",
         BackendArg::PeaksFile => "peaks-file",
+        BackendArg::IqFile => "iq-file",
         BackendArg::Airspy => "airspy",
         BackendArg::Soapy => "soapy",
     }
@@ -602,7 +600,7 @@ fn resolve_backend(config: &AppConfig, args: &ScanArgs) -> Result<BackendArg> {
         .ok_or_else(|| anyhow!("scan backend is required; set --backend or [device].backend"))?;
 
     BackendArg::from_str(backend, true).map_err(|_| {
-        anyhow!("unknown backend '{backend}', expected synthetic/peaks-file/airspy/soapy")
+        anyhow!("unknown backend '{backend}', expected synthetic/peaks-file/iq-file/airspy/soapy")
     })
 }
 
@@ -613,49 +611,6 @@ fn resolve_output_arg(config: &AppConfig, args: &ScanArgs) -> Result<OutputArg> 
     let output = config.scan.output.trim();
     OutputArg::from_str(output, true)
         .map_err(|_| anyhow!("unknown output '{output}', expected tui/table/json"))
-}
-
-struct ScanPassData {
-    peaks: Vec<Peak>,
-    spectrum_bands: Vec<SpectrumBand>,
-}
-
-fn collect_pass_data(
-    source: &mut ScanSource,
-    profiles: &[DetectionProfile],
-    scan: &camfinder::config::ScanSettings,
-    args: &ScanArgs,
-    logs: &mut VecDeque<String>,
-) -> Result<ScanPassData> {
-    match source {
-        ScanSource::Synthetic => {
-            let peaks = synthetic_peaks(profiles, args)?;
-            push_log(logs, format!("synthetic generated {} peaks", peaks.len()));
-            Ok(ScanPassData {
-                peaks,
-                spectrum_bands: Vec::new(),
-            })
-        }
-        ScanSource::PeaksFile(path) => {
-            let peaks = load_peaks_file(path)?;
-            push_log(
-                logs,
-                format!("loaded {} peaks from {}", peaks.len(), path.display()),
-            );
-            Ok(ScanPassData {
-                peaks,
-                spectrum_bands: Vec::new(),
-            })
-        }
-        ScanSource::Sdr(scanner) => {
-            let mut log_fn = |line: String| push_log(logs, line);
-            let output = scan_sdr(scanner.as_mut(), profiles, scan, &mut log_fn)?;
-            Ok(ScanPassData {
-                peaks: output.peaks,
-                spectrum_bands: output.spectrum_bands,
-            })
-        }
-    }
 }
 
 fn push_log(logs: &mut VecDeque<String>, line: impl Into<String>) {
@@ -698,7 +653,10 @@ fn sleep_interruptible(delay: Duration, deadline: Option<Instant>, stop: &Atomic
     }
 }
 
-fn send_tui_snapshot(sender: &Option<mpsc::Sender<TuiScanSnapshot>>, snapshot: TuiScanSnapshot) {
+fn send_tui_snapshot(
+    sender: &Option<mpsc::SyncSender<TuiScanSnapshot>>,
+    snapshot: TuiScanSnapshot,
+) {
     if let Some(sender) = sender {
         let _ = sender.send(snapshot);
     }
@@ -706,6 +664,7 @@ fn send_tui_snapshot(sender: &Option<mpsc::Sender<TuiScanSnapshot>>, snapshot: T
 
 fn print_devices() -> Result<()> {
     println!("Airspy:");
+    #[cfg(feature = "airspy")]
     match list_airspy_devices() {
         Ok(devices) if devices.is_empty() => println!("  No Airspy devices found."),
         Ok(devices) => {
@@ -830,6 +789,9 @@ fn apply_scan_arg_overrides(config: &mut AppConfig, args: &ScanArgs) -> Result<(
     if let Some(record_path) = &args.record {
         config.scan.record_path = Some(record_path.clone());
     }
+    if let Some(mode) = args.record_mode {
+        config.scan.record_mode = mode.into();
+    }
     if let Some(record_spectrum_bins) = args.record_spectrum_bins {
         config.scan.record_spectrum_bins = record_spectrum_bins;
     }
@@ -849,9 +811,16 @@ fn collect_masks(config: &AppConfig, args: &ScanArgs) -> Result<MaskSet> {
 
 fn airspy_settings_from_args(base: &AirspySettings, args: &ScanArgs) -> Result<AirspySettings> {
     let mut settings = base.clone();
+    if let Some(frames) = args.fft_frames {
+        settings.fft_frames = Some(frames);
+    }
+    if let Some(timeout) = args.capture_timeout_ms {
+        settings.capture_timeout_ms = timeout;
+    }
 
     if let Some(dwell_ms) = args.dwell_ms {
         settings.dwell_ms = dwell_ms;
+        settings.fft_frames = None;
     }
     if let Some(settle_ms) = args.settle_ms {
         settings.settle_ms = settle_ms;
@@ -864,6 +833,7 @@ fn airspy_settings_from_args(base: &AirspySettings, args: &ScanArgs) -> Result<A
     }
     if let Some(dwell_ms) = args.airspy_dwell_ms {
         settings.dwell_ms = dwell_ms;
+        settings.fft_frames = None;
     }
     if let Some(fft_size) = args.airspy_fft_size {
         settings.fft_size = fft_size;
@@ -901,9 +871,16 @@ fn airspy_settings_from_args(base: &AirspySettings, args: &ScanArgs) -> Result<A
 
 fn soapy_settings_from_args(base: &SoapySettings, args: &ScanArgs) -> Result<SoapySettings> {
     let mut settings = base.clone();
+    if let Some(frames) = args.fft_frames {
+        settings.fft_frames = Some(frames);
+    }
+    if let Some(timeout) = args.capture_timeout_ms {
+        settings.capture_timeout_ms = timeout;
+    }
 
     if let Some(dwell_ms) = args.dwell_ms {
         settings.dwell_ms = dwell_ms;
+        settings.fft_frames = None;
     }
     if let Some(settle_ms) = args.settle_ms {
         settings.settle_ms = settle_ms;
@@ -922,6 +899,7 @@ fn soapy_settings_from_args(base: &SoapySettings, args: &ScanArgs) -> Result<Soa
     }
     if let Some(dwell_ms) = args.soapy_dwell_ms {
         settings.dwell_ms = dwell_ms;
+        settings.fft_frames = None;
     }
     if let Some(fft_size) = args.soapy_fft_size {
         settings.fft_size = fft_size;
@@ -979,7 +957,7 @@ fn parse_soapy_gain_element(input: &str) -> Result<SoapyGainElement> {
     })
 }
 
-fn synthetic_peaks(profiles: &[DetectionProfile], args: &ScanArgs) -> Result<Vec<Peak>> {
+fn synthetic_options(args: &ScanArgs) -> Result<SyntheticOptions> {
     let missing_mhz = args
         .synthetic_missing
         .iter()
@@ -999,21 +977,7 @@ fn synthetic_peaks(profiles: &[DetectionProfile], args: &ScanArgs) -> Result<Vec
         missing_mhz,
         interferers,
     };
-    Ok(generate_peaks(profiles, &options))
-}
-
-#[derive(Debug, Deserialize)]
-struct PeaksDocument {
-    peaks: Vec<Peak>,
-}
-
-fn load_peaks_file(path: &Path) -> Result<Vec<Peak>> {
-    let raw = fs::read_to_string(path)?;
-    if let Ok(peaks) = serde_json::from_str::<Vec<Peak>>(&raw) {
-        return Ok(peaks);
-    }
-    let document: PeaksDocument = serde_json::from_str(&raw)?;
-    Ok(document.peaks)
+    Ok(options)
 }
 
 fn print_scan_table(
