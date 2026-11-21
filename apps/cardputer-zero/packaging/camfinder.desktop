@@ -1,6 +1,6 @@
 [Desktop Entry]
 Name=Camfinder
-Exec=/usr/share/APPLaunch/bin/camfinder-cardputer-zero
+Exec=/usr/bin/env CAMFINDER_FRAMEBUFFER=/dev/fb0 /usr/share/APPLaunch/bin/camfinder-cardputer-zero
 Terminal=false
 Sysplause=true
 Icon=share/images/camfinder.png

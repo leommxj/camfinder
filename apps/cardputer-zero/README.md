@@ -18,9 +18,11 @@ cargo xtask cardputer-zero
 sudo apt install ./target/dist/camfinder-cardputer-zero_0.1.0-1_arm64.deb
 ```
 
-The package installs an entry in the Cardputer Zero launcher. The application
-runs as the logged-in user; this user needs access to the framebuffer, keyboard
-and Airspy through the `video`, `input` and `plugdev` groups. The package includes
+The package installs an entry in the Cardputer Zero launcher that explicitly
+selects the built-in framebuffer, including when the launcher inherits desktop
+display variables. The application runs as the logged-in user; this user needs
+access to the framebuffer, keyboard and Airspy through the `video`, `input` and
+`plugdev` groups. The package includes
 an Airspy udev rule and declares its SDL2, SDL2_ttf and font dependencies.
 
 The build target defaults to `aarch64-unknown-linux-gnu`. Cross compilation
