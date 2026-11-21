@@ -43,6 +43,36 @@ pub struct PersistenceSummary {
     pub last_offset: Option<OffsetEstimate>,
 }
 
+impl PersistenceSummary {
+    pub fn current_result<'a>(
+        &self,
+        results: &'a [ProfileDetection],
+    ) -> Option<&'a ProfileDetection> {
+        results
+            .iter()
+            .filter_map(|result| {
+                if result.profile != self.profile {
+                    return None;
+                }
+                let distance = match (self.offset_group_hz, result.offset_group_hz) {
+                    (Some(a), Some(b)) => (a - b).abs(),
+                    (None, None) => 0.0,
+                    _ => return None,
+                };
+                let tolerance = self
+                    .offset_tolerance_hz
+                    .max(result.offset_tolerance_hz)
+                    .max(1.0);
+                (distance <= tolerance).then_some((distance, result))
+            })
+            .min_by(|(a, left), (b, right)| {
+                a.total_cmp(b)
+                    .then_with(|| left.suspect_key.cmp(&right.suspect_key))
+            })
+            .map(|(_, result)| result)
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct PersistenceTracker {
     stats: BTreeMap<String, ProfilePersistence>,

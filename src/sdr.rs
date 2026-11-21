@@ -1,6 +1,8 @@
-use crate::config::{DetectionProfile, RecordMode, ScanSettings, DEFAULT_CONFIG_TOML};
+use crate::config::{
+    target_frequencies, DetectionProfile, RecordMode, ScanSettings, DEFAULT_CONFIG_TOML,
+};
 use crate::dsp::{Complex32, PeakCandidate, SpectrumAnalyzer, SpectrumSettings};
-use crate::frequency::{format_frequency_hz, MHZ};
+use crate::frequency::format_frequency_hz;
 use crate::peak::{Peak, SpectrumBand};
 use anyhow::{anyhow, Context, Result};
 use serde::{Deserialize, Serialize};
@@ -212,7 +214,7 @@ impl SdrPipeline {
         let mut batches = Vec::new();
         let mut pending = 0usize;
         let capture_result = (|| -> Result<()> {
-            for (sequence, target_hz) in unique_target_freqs_hz(profiles).into_iter().enumerate() {
+            for (sequence, target_hz) in target_frequencies(profiles).into_iter().enumerate() {
                 if stop.load(Ordering::Relaxed) {
                     break;
                 }
@@ -682,14 +684,4 @@ fn default_soapy_gain_settings() -> SoapyGainSettings {
 #[derive(Deserialize)]
 struct DeviceDefaults {
     device: DeviceSettings,
-}
-
-fn unique_target_freqs_hz(profiles: &[DetectionProfile]) -> Vec<f64> {
-    let mut freqs = profiles
-        .iter()
-        .flat_map(|profile| profile.freqs_mhz.iter().map(|freq_mhz| freq_mhz * MHZ))
-        .collect::<Vec<_>>();
-    freqs.sort_by(|left, right| left.partial_cmp(right).unwrap_or(std::cmp::Ordering::Equal));
-    freqs.dedup_by(|left, right| (*left - *right).abs() < 1.0);
-    freqs
 }

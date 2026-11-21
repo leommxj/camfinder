@@ -25,11 +25,8 @@ pub fn parse_duration(input: &str) -> Result<Duration> {
         .map_err(|err| anyhow!("invalid duration '{input}': {err}"))?
         * multiplier;
 
-    if seconds < 0.0 {
-        return Err(anyhow!("duration cannot be negative: '{input}'"));
-    }
-
-    Ok(Duration::from_secs_f64(seconds))
+    Duration::try_from_secs_f64(seconds)
+        .map_err(|_| anyhow!("duration must be finite, nonnegative and representable: '{input}'"))
 }
 
 pub fn format_duration(duration: Duration) -> String {

@@ -7,6 +7,11 @@ use std::fs;
 use std::path::Path;
 use std::path::PathBuf;
 
+mod preferences;
+mod request;
+pub use preferences::{PreferenceField, ProfilePreset, ScanPreferences, SettingsStore};
+pub use request::{apply_profile_settings, Backend, ResolvedScan, ScanRequest};
+
 pub const DEFAULT_CONFIG_TOML: &str = include_str!("../camfinder.default.toml");
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -130,13 +135,17 @@ pub struct DetectionGroup {
 }
 
 impl DetectionProfile {
+    pub fn parse(raw: &str, source: &Path) -> Result<Self> {
+        let profile: Self = toml::from_str(raw)
+            .with_context(|| format!("failed to parse profile {}", source.display()))?;
+        profile.validate(source)?;
+        Ok(profile)
+    }
+
     pub fn load(path: &Path) -> Result<Self> {
         let raw = fs::read_to_string(path)
             .with_context(|| format!("failed to read profile file {}", path.display()))?;
-        let profile: Self = toml::from_str(&raw)
-            .with_context(|| format!("failed to parse profile file {}", path.display()))?;
-        profile.validate(path)?;
-        Ok(profile)
+        Self::parse(&raw, path)
     }
 
     pub fn nominal_freqs_hz(&self) -> Vec<f64> {
@@ -202,7 +211,7 @@ impl DetectionProfile {
         self
     }
 
-    fn validate(&self, path: &Path) -> Result<()> {
+    pub fn validate(&self, path: &Path) -> Result<()> {
         if self.name.trim().is_empty() {
             return Err(anyhow!(
                 "profile file {} has an empty profile name",
@@ -240,8 +249,37 @@ impl DetectionProfile {
                 ));
             }
         }
+        for profile in self.detection_profiles() {
+            anyhow::ensure!(
+                profile
+                    .freqs_mhz
+                    .iter()
+                    .all(|value| value.is_finite() && *value > 0.0),
+                "profile '{}' requires positive finite frequencies",
+                profile.name
+            );
+            anyhow::ensure!(
+                profile.min_hits > 0
+                    && profile.min_score.is_finite()
+                    && profile.max_offset_spread_hz.is_finite()
+                    && profile.max_offset_spread_hz > 0.0,
+                "profile '{}' has invalid detection thresholds",
+                profile.name
+            );
+        }
         Ok(())
     }
+}
+
+pub fn target_frequencies(profiles: &[DetectionProfile]) -> Vec<f64> {
+    let mut frequencies = profiles
+        .iter()
+        .flat_map(DetectionProfile::detection_profiles)
+        .flat_map(|profile| profile.nominal_freqs_hz())
+        .collect::<Vec<_>>();
+    frequencies.sort_by(f64::total_cmp);
+    frequencies.dedup_by(|a, b| (*a - *b).abs() < 1.0);
+    frequencies
 }
 
 #[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]

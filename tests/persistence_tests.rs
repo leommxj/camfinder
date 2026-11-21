@@ -44,6 +44,31 @@ fn weak_result_at(profile: &str, offset_hz: f64) -> ProfileDetection {
 }
 
 #[test]
+fn current_details_choose_nearest_compatible_result_independent_of_input_order() {
+    let mut tracker = PersistenceTracker::new(3, 0.6);
+    tracker.update(&[result_at("p", true, 12_500.0)]);
+    let summary = tracker.summaries().remove(0);
+    let mut results = vec![
+        result_at("p", true, 13_100.0),
+        result_at("p", true, 12_600.0),
+        result_at("other", true, 12_500.0),
+    ];
+    assert_eq!(
+        summary.current_result(&results).unwrap().offset_group_hz,
+        Some(12_600.0)
+    );
+    results.reverse();
+    assert_eq!(
+        summary.current_result(&results).unwrap().offset_group_hz,
+        Some(12_600.0)
+    );
+    assert!(summary
+        .current_result(&[result_at("p", true, 20_000.0)])
+        .is_none());
+    assert!(summary.current_result(&[]).is_none());
+}
+
+#[test]
 fn requires_persistent_hits_for_stable_state() {
     let mut tracker = PersistenceTracker::new(3, 0.6);
     tracker.update(&[result("p", true)]);

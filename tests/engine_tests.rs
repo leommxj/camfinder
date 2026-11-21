@@ -4,6 +4,89 @@ use camfinder::sdr::DeviceSettings;
 use std::sync::{atomic::AtomicBool, Arc};
 use std::time::{Duration, Instant};
 
+#[test]
+fn observed_single_pass_matches_the_synchronous_engine() {
+    use camfinder::engine::RunOptions;
+    let mut engine = ScanEngine::new(config()).unwrap();
+    let expected = engine
+        .scan(&Arc::new(AtomicBool::new(false)), &mut |_| {}, &mut |_| {})
+        .unwrap()
+        .unwrap();
+    let (mut session, passes) = ScanSession::observe(
+        config(),
+        RunOptions {
+            repeat: false,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let pass = passes.recv_timeout(Duration::from_secs(3)).unwrap();
+    wait_for(&session, |snapshot| {
+        snapshot.status == SessionStatus::Stopped
+    });
+    assert_eq!(
+        serde_json::to_value(&expected.results).unwrap(),
+        serde_json::to_value(&pass.results).unwrap()
+    );
+    assert_eq!(session.snapshot().pass, 1);
+    assert!(passes.try_recv().is_err());
+    session.stop().unwrap();
+}
+
+#[test]
+fn duration_expires_while_paused_and_during_a_long_repeat_delay() {
+    use camfinder::engine::RunOptions;
+    for paused in [false, true] {
+        let mut session = ScanSession::start_with_options(
+            config(),
+            RunOptions {
+                duration: Some(Duration::from_millis(300)),
+                repeat_delay: Duration::from_secs(30),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        wait_for(&session, |snapshot| snapshot.pass == 1);
+        if paused {
+            session.command(SessionCommand::Pause);
+        }
+        wait_for(&session, |snapshot| {
+            snapshot.status == SessionStatus::Stopped
+        });
+        assert_eq!(session.snapshot().pass, 1);
+        assert!(session.snapshot().elapsed_seconds < 2.0);
+        session.stop().unwrap();
+    }
+}
+
+#[test]
+fn stopping_an_unread_observer_does_not_block_on_its_full_queue() {
+    let (mut session, _passes) = ScanSession::observe(config(), Default::default()).unwrap();
+    wait_for(&session, |snapshot| snapshot.pass >= 2);
+    let start = Instant::now();
+    session.stop().unwrap();
+    assert!(start.elapsed() < Duration::from_secs(1));
+}
+
+#[test]
+fn applying_invalid_configuration_keeps_the_current_session_running() {
+    use camfinder::config::ResolvedScan;
+    let mut session = ScanSession::start(config()).unwrap();
+    wait_for(&session, |snapshot| snapshot.pass > 0);
+    let before = session.snapshot().pass;
+    let mut invalid = config();
+    invalid.confirm_ratio = f64::NAN;
+    assert!(session
+        .apply(ResolvedScan {
+            engine: invalid,
+            run: Default::default(),
+            output: "tui".into()
+        })
+        .is_err());
+    wait_for(&session, |snapshot| snapshot.pass > before);
+    session.stop().unwrap();
+}
+
 fn config() -> EngineConfig {
     EngineConfig {
         profiles: vec![DetectionProfile {
