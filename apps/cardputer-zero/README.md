@@ -33,8 +33,9 @@ The package installs an entry in the Cardputer Zero launcher that explicitly
 selects the built-in framebuffer, including when the launcher inherits desktop
 display variables. The application runs as the logged-in user; this user needs
 access to the framebuffer, keyboard and Airspy through the `video`, `input` and
-`plugdev` groups. The package includes
-an Airspy udev rule and declares its SDL2, SDL2_ttf and font dependencies.
+`plugdev` groups. The package installs the Airspy udev rule at
+`/usr/lib/udev/rules.d/60-camfinder-cardputer-zero.rules` and declares its SDL2,
+SDL2_ttf and font dependencies.
 
 The build target defaults to `aarch64-unknown-linux-gnu`. Cross compilation
 requires an ARM64 linker and ARM64 SDL2/SDL2_ttf libraries. Set
@@ -88,9 +89,9 @@ The backend, device, gain and capture settings come from that TOML file.
 For SoapySDR, set `[device] backend = "soapy"` and configure `[device.soapy]`.
 
 The Debian package includes `camfinder.default.toml` and the complete `profiles/`
-directory under `/usr/share/camfinder/`. To customize them, copy the template
-and `profiles/` into your configuration directory and rename the template to
-`config.toml`. To use a custom profile, replace `preset` with
+directory under `/usr/share/camfinder-cardputer-zero/`. To customize them, copy
+the template and `profiles/` into your configuration directory and rename the
+template to `config.toml`. To use a custom profile, replace `preset` with
 `profile_files = ["profiles/best_high_airspy.toml"]`; relative paths are resolved
 from the configuration file's directory. Package upgrades update the examples
 without changing your user configuration.

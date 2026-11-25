@@ -266,10 +266,10 @@ fn stage(
     )?;
     copy(
         &packaging.join("60-camfinder-airspy.rules"),
-        &staging.join("usr/lib/udev/rules.d/60-camfinder-airspy.rules"),
+        &staging.join(format!("usr/lib/udev/rules.d/60-{PACKAGE}.rules")),
         0o644,
     )?;
-    let data = staging.join("usr/share/camfinder");
+    let data = staging.join("usr/share").join(PACKAGE);
     copy(
         &root.join("camfinder.default.toml"),
         &data.join("camfinder.default.toml"),
@@ -290,20 +290,19 @@ fn stage(
         &doc.join("rs-spy-LICENSE"),
         0o644,
     )?;
-    let store = staging.join("usr/share").join(PACKAGE);
     copy(
         &review.join("app-builder.json"),
-        &store.join("app-builder.json"),
+        &data.join("app-builder.json"),
         0o644,
     )?;
     copy(
         &review.join("assets/icon.png"),
-        &store.join("assets/icon.png"),
+        &data.join("assets/icon.png"),
         0o644,
     )?;
     copy(
         &review.join("assets/screenshot.png"),
-        &store.join("assets/screenshot.png"),
+        &data.join("assets/screenshot.png"),
         0o644,
     )?;
     let dynamic = String::from_utf8(run(Command::new("readelf")
