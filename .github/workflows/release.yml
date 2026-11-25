@@ -1,0 +1,85 @@
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        include:
+          - arch: x86_64
+            runner: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+    runs-on: ${{ matrix.runner }}
+    env:
+      TARGET: ${{ matrix.target }}
+      ARCH: ${{ matrix.arch }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Check release version
+        shell: bash
+        run: |
+          cargo metadata --locked --no-deps --format-version 1 |
+            jq -e --arg tag "$GITHUB_REF_NAME" 'all(.packages[]; "v" + .version == $tag)'
+      - name: Build terminal application
+        run: cargo build --locked --release --package camfinder-terminal --target "$TARGET"
+      - name: Package terminal application
+        run: |
+          package="camfinder-${GITHUB_REF_NAME}-linux-${ARCH}"
+          mkdir -p "target/dist/$package"
+          cp "target/$TARGET/release/camfinder" README.md LICENSE camfinder.default.toml "target/dist/$package/"
+          cp -r profiles docs "target/dist/$package/"
+          mkdir -p "target/dist/$package/apps/cardputer-zero"
+          cp apps/cardputer-zero/README.md "target/dist/$package/apps/cardputer-zero/"
+          cp vendor/rs-spy/LICENSE "target/dist/$package/rs-spy-LICENSE"
+          cp apps/cardputer-zero/packaging/60-camfinder-airspy.rules "target/dist/$package/"
+          tar -C target/dist -czf "target/dist/$package.tar.gz" "$package"
+      - name: Install Cardputer Zero build libraries
+        if: matrix.arch == 'arm64'
+        run: sudo apt-get update && sudo apt-get install -y libsdl2-dev libsdl2-ttf-dev fonts-dejavu-core
+      - name: Build Cardputer Zero Debian package
+        if: matrix.arch == 'arm64'
+        run: cargo xtask cardputer-zero
+      - uses: actions/upload-artifact@v4
+        with:
+          name: packages-${{ matrix.arch }}
+          path: |
+            target/dist/*.tar.gz
+            target/dist/*.deb
+          if-no-files-found: error
+
+  release:
+    needs: build
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: packages-*
+          merge-multiple: true
+          path: dist
+      - name: Generate checksums
+        working-directory: dist
+        run: sha256sum *.tar.gz *.deb > SHA256SUMS
+      - name: Publish release
+        working-directory: dist
+        run: |
+          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            gh release upload "$GITHUB_REF_NAME" *.tar.gz *.deb SHA256SUMS --clobber
+          else
+            gh release create "$GITHUB_REF_NAME" *.tar.gz *.deb SHA256SUMS \
+              --verify-tag --generate-notes --title "$GITHUB_REF_NAME"
+          fi

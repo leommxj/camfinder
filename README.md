@@ -4,10 +4,15 @@ Experimental SDR-assisted camera leakage detector.
 
 The detector looks for weak electromagnetic leakage near crystal-clock
 harmonics. It scans configured harmonic frequencies, finds narrow peaks, fits a
-shared offset model, and tracks persistent suspects in the TUI.
+shared offset model, and tracks persistent candidates across scans.
+
+**Practical detection relies heavily on an external low-noise amplifier (LNA).**
+The [original experiments](https://www.leommxj.com/2026/06/11/EM-leakage-based-hidden-camera-detection/)
+used a 20 dB external LNA; neither an Airspy Mini nor a USRP B210 captured the
+leakage effectively without one.
 
 The Cargo workspace contains the portable library at the repository root,
-the [terminal application](apps/terminal/) for CLI/TUI output, and the
+the terminal application in `apps/terminal/` for CLI/TUI output, and the
 [Cardputer Zero application](apps/cardputer-zero/README.md).
 The terminal application builds the `camfinder` command and is selected by
 `cargo run` from the repository root.
@@ -17,6 +22,30 @@ Configuration and scan sessions are shared across frontends. See
 
 ## Human Says
 see [this](https://www.leommxj.com/2026/06/11/EM-leakage-based-hidden-camera-detection/)
+
+## Releases
+
+Pushing a version tag such as `v0.1.1` builds and publishes a
+[GitHub Release](https://github.com/leommxj/camfinder/releases) with:
+
+- Linux x86_64 and ARM64 CLI/TUI archives (`camfinder-v<version>-linux-<arch>.tar.gz`).
+- A Cardputer Zero ARM64 Debian package (`camfinder-cardputer-zero_<version>-1_arm64.deb`).
+- `SHA256SUMS` for the three packages.
+
+The tag must match the version in every workspace package. The release is
+published after both build jobs succeed. Ordinary branch pushes do not trigger
+the workflow; it builds and packages without running tests.
+
+Terminal archives contain the `camfinder` executable, documentation, licenses,
+example configuration, profiles and an Airspy udev rule. Extract the archive and run
+`./camfinder scan --preset 24+27`. These builds use the default Airspy backend;
+SoapySDR support requires building from source with `--features soapy`. Linux
+packages are built on Ubuntu 24.04 and require a compatible glibc-based system.
+
+If the Airspy USB device is not accessible to your user, install the included
+`60-camfinder-airspy.rules` into `/etc/udev/rules.d/`, reload the udev rules and
+reconnect the receiver. Your user must belong to the `plugdev` group. For the
+device application, follow the [Cardputer Zero installation instructions](apps/cardputer-zero/README.md).
 
 ## Current Workflow
 
@@ -44,7 +73,7 @@ Record a wide 24/27 MHz sweep for offline analysis:
 
 ```bash
 cargo run -- scan --profile profiles/wide_24_27_216_972_airspy.toml \
-  --record captures/scene.jsonl --duration 2m
+  --record captures/scene.jsonl --record-mode spectrum --duration 2m
 ```
 
 Use a one-off frequency list without a profile file:
@@ -106,7 +135,11 @@ Each JSONL line is one scan pass. Recorded passes include:
 - detected peaks and peak shape fields
 - candidate results
 - persistence summaries
-- `spectrum_bands` with the full search-window spectrum and occupancy metrics
+- capture and processing statistics
+
+The default recording mode is `peaks`. Use `--record-mode summary` to add
+search-window occupancy metrics, or `--record-mode spectrum` to also store
+the search-window spectrum in `spectrum_bands`.
 
 Use `--record-band-decimation N` to store every Nth FFT bin when captures become
 too large.
@@ -130,10 +163,11 @@ Airspy native backend:
 
 ```bash
 cargo run -- scan --profile profiles/best_high_airspy.toml \
-  --backend airspy --gain-mode manual --lna 15 --mixer 15 --vga 2
+  --backend airspy --gain-mode manual --lna 14 --mixer 15 --vga 2
 ```
 
-SoapySDR backend:
+SoapySDR backend (on Debian/Ubuntu, install `pkg-config` and
+`libsoapysdr-dev` before building):
 
 ```bash
 cargo build --features soapy
@@ -145,6 +179,26 @@ SoapySDR requires the native runtime and driver module, such as
 Linux. On Windows, install PothosSDR and add its `bin` directory to `PATH`.
 
 ## Config
+
+The terminal and Cardputer Zero applications use the same TOML configuration,
+loaded and saved by the core. Both read `~/.config/camfinder/config.toml` by
+default (`$XDG_CONFIG_HOME/camfinder/config.toml` when set). If it is absent,
+the core uses the embedded defaults.
+
+An embedded `preset = "24+27"` selects detection frequencies and thresholds;
+receiver and scan settings come from the same TOML file. Other presets are
+`25`, `all`, `24` and `27`. For custom profiles, omit `preset` and use
+`profile_files = ["profile.toml"]` or inline `[[profiles]]` entries. Paths in a
+configuration or profile file are relative to that file.
+
+Omitted device and scan fields use the embedded defaults. For either receiver,
+setting `dwell_ms` without `fft_frames` selects capture by duration; an explicit
+`fft_frames` selects a fixed number of FFT frames instead.
+
+Enable recording with `[scan] record = true` and `record_mode = "peaks"`,
+`"summary"` or `"spectrum"`. The core creates a new recording under
+`~/.local/share/camfinder/recordings/`; `XDG_DATA_HOME` overrides the base.
+An explicit `record_path` selects a fixed output file instead.
 
 Print the embedded default config:
 
@@ -164,5 +218,5 @@ Show the loaded config:
 cargo run -- show-config
 ```
 
-If a required backend setting is missing, scan startup returns an error instead
-of silently choosing a hardware path.
+The default backend is Airspy. Backends that require an input file, such as
+`peaks-file` or `iq-file`, report an error if its path is missing.
