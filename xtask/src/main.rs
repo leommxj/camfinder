@@ -269,6 +269,20 @@ fn stage(
         &staging.join("usr/lib/udev/rules.d/60-camfinder-airspy.rules"),
         0o644,
     )?;
+    let data = staging.join("usr/share/camfinder");
+    copy(
+        &root.join("camfinder.default.toml"),
+        &data.join("camfinder.default.toml"),
+        0o644,
+    )?;
+    for entry in fs::read_dir(root.join("profiles"))? {
+        let entry = entry?;
+        copy(
+            &entry.path(),
+            &data.join("profiles").join(entry.file_name()),
+            0o644,
+        )?;
+    }
     let doc = staging.join("usr/share/doc").join(PACKAGE);
     copy(&root.join("LICENSE"), &doc.join("LICENSE"), 0o644)?;
     copy(
@@ -321,6 +335,7 @@ fn stage(
     let dependencies = [
         ("libSDL2-2.0.so.0", "libsdl2-2.0-0 (>= 2.0.18)"),
         ("libSDL2_ttf-2.0.so.0", "libsdl2-ttf-2.0-0 (>= 2.0.15)"),
+        ("libSoapySDR.so.0.8", "libsoapysdr0.8 (>= 0.8.0)"),
         ("libgcc_s.so.1", "libgcc-s1"),
     ];
     for line in dynamic.lines().filter(|line| line.contains("(NEEDED)")) {
@@ -357,7 +372,7 @@ fn stage(
     let control = staging.join("DEBIAN");
     fs::create_dir_all(&control)?;
     let size = directory_size(staging)? / 1024 + 1;
-    fs::write(control.join("control"), format!("Package: {PACKAGE}\nVersion: {version}-1\nArchitecture: arm64\nMaintainer: leommxj\nSection: APPLaunch\nPriority: optional\nInstalled-Size: {size}\nDepends: {}\nDescription: Airspy spectrum scanner for CardputerZero\n Scan signals, match harmonics, and track candidates on CardputerZero.\n", depends.join(", ")))?;
+    fs::write(control.join("control"), format!("Package: {PACKAGE}\nVersion: {version}-1\nArchitecture: arm64\nMaintainer: leommxj\nSection: APPLaunch\nPriority: optional\nInstalled-Size: {size}\nDepends: {}\nDescription: Experimental SDR-assisted camera leakage detector for Cardputer Zero\n Scan crystal-clock harmonics for weak electromagnetic leakage and track\n persistent candidates on the built-in display.\n Practical detection relies heavily on an external low-noise amplifier\n (LNA). The original tests used a 20 dB LNA; Airspy Mini and USRP B210 alone\n did not capture the leakage effectively.\n Receiver support depends on the backends enabled at build time.\n", depends.join(", ")))?;
     copy(
         &packaging.join("postinst"),
         &control.join("postinst"),

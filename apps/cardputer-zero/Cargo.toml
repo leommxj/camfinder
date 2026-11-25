@@ -5,10 +5,15 @@ edition = "2021"
 authors = ["leommxj"]
 license = "WTFPL"
 
+[features]
+default = ["airspy"]
+airspy = ["camfinder/airspy"]
+soapy = ["camfinder/soapy"]
+
 [dependencies]
 anyhow = "1"
 ctrlc = "3.5"
-camfinder = { path = "../..", default-features = false, features = ["airspy"] }
+camfinder = { path = "../..", default-features = false }
 sdl2 = { version = "0.38", features = ["ttf"] }
 serde_json = "1"
 png = "0.17"

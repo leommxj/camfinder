@@ -1,7 +1,18 @@
 # Camfinder for Cardputer Zero
 
-The device application uses the shared Camfinder scan engine with an Airspy
-receiver. It displays harmonic candidates on the built-in 320×170 screen.
+Experimental SDR-assisted camera leakage detector for Cardputer Zero.
+
+Camfinder looks for weak electromagnetic leakage near crystal-clock harmonics.
+It scans configured harmonic frequencies, finds narrow peaks, fits a shared
+offset model, and tracks persistent candidates on the built-in 320×170 screen.
+
+**Practical detection relies heavily on an external low-noise amplifier (LNA).**
+The [original experiments](https://www.leommxj.com/2026/06/11/EM-leakage-based-hidden-camera-detection/)
+used a 20 dB external LNA; neither an Airspy Mini nor a USRP B210 captured the
+leakage effectively without one.
+
+The default package includes the Airspy backend. Both applications can also
+use other SDR receivers through the optional SoapySDR backend.
 
 ## Build and install
 
@@ -33,8 +44,21 @@ for packaging an existing binary or supplying a screenshot.
 
 Packages and review metadata are written to `dist/` under Cargo's target
 directory, normally `target/dist/`. This follows `CARGO_TARGET_DIR` or
-`build.target-dir`; `--output` overrides the package destination. The GitHub
-workflow builds an ARM64 package for version tags and manual runs.
+`build.target-dir`; `--output` overrides the package destination. Pushing a
+matching version tag such as `v0.1.1` builds the ARM64 package and publishes it
+alongside the terminal application in
+[GitHub Releases](https://github.com/leommxj/camfinder/releases).
+
+To build with SoapySDR, install `libsoapysdr-dev` and the receiver's SoapySDR
+driver module, then run:
+
+```sh
+cargo build --locked --release --package camfinder-cardputer-zero --features soapy
+```
+
+For an ARM64 package, add `--target aarch64-unknown-linux-gnu` and package that
+binary with `cargo xtask cardputer-zero --no-build`. The target system also
+needs the receiver's SoapySDR driver module.
 
 ## Controls
 
@@ -56,13 +80,32 @@ bar indicates the remaining list. Candidates are signal matches, not confirmed
 cameras.
 
 Configuration and scan control use the shared core described in
-[Core and frontends](../../docs/architecture.md). Settings are saved under
-`~/.config/camfinder/`. When no shared settings exist, the previous
-`~/.config/camfinder-cardputer-zero/settings.json` is loaded; saving writes the
-shared location. Existing recordings stay in their original directory, while
-new recordings use `~/.local/share/camfinder/recordings/`. `XDG_CONFIG_HOME` and
-`XDG_DATA_HOME` override the base directories. Recording modes are Peaks,
-Summary and Spectrum. Full-spectrum recording uses substantially more disk space.
+[Core and frontends](../../docs/architecture.md). Both applications read
+`~/.config/camfinder/config.toml`; the settings page saves changes there.
+Pass `--config path/to/config.toml` to
+edit another configuration, also accepted by the terminal application.
+The backend, device, gain and capture settings come from that TOML file.
+For SoapySDR, set `[device] backend = "soapy"` and configure `[device.soapy]`.
+
+The Debian package includes `camfinder.default.toml` and the complete `profiles/`
+directory under `/usr/share/camfinder/`. To customize them, copy the template
+and `profiles/` into your configuration directory and rename the template to
+`config.toml`. To use a custom profile, replace `preset` with
+`profile_files = ["profiles/best_high_airspy.toml"]`; relative paths are resolved
+from the configuration file's directory. Package upgrades update the examples
+without changing your user configuration.
+
+The settings page edits the detection preset, gain and recording mode.
+Changing a preset preserves the receiver settings. Editing Soapy gain selects
+manual overall gain; per-stage gains and AGC can be set in the TOML file.
+Saving expands referenced profiles into the configuration without modifying
+the original profile files.
+
+If the default TOML file is absent, the core uses the embedded defaults.
+An explicit `--config` path must exist. Recordings use
+`~/.local/share/camfinder/recordings/`. `XDG_CONFIG_HOME` and `XDG_DATA_HOME`
+override the base directories. Recording modes are Peaks, Summary and
+Spectrum. Full-spectrum recording uses substantially more disk space.
 
 ## Preview without hardware
 

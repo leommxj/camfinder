@@ -1,5 +1,5 @@
 use anyhow::{Context, Result};
-use camfinder::config::{PreferenceField, ScanPreferences as Settings};
+use camfinder::config::{AppConfig as Settings, PreferenceField};
 use camfinder::engine::{ScanSnapshot, SessionStatus};
 use camfinder::persistence::StabilityState;
 use sdl2::keyboard::Keycode;
@@ -114,6 +114,16 @@ impl Ui {
             self.scan_header(canvas, fonts, snapshot, demo)?;
         } else {
             text(canvas, &fonts.title, 8, 4, 180, TEXT, "Camfinder")?;
+            let backend = if demo {
+                "DEMO".into()
+            } else {
+                settings
+                    .device
+                    .backend
+                    .as_deref()
+                    .unwrap_or("")
+                    .to_ascii_uppercase()
+            };
             text(
                 canvas,
                 &fonts.body,
@@ -121,7 +131,7 @@ impl Ui {
                 6,
                 77,
                 if demo { WARNING } else { ACCENT },
-                if demo { "DEMO" } else { "AIRSPY" },
+                &backend,
             )?;
             fill(canvas, Rect::new(8, 27, 304, 1), PANEL)?;
         }
@@ -151,7 +161,7 @@ impl Ui {
                 117,
                 304,
                 MUTED,
-                "Reconnect Airspy, then press 8 to retry.",
+                "Check receiver, then press 8 to retry.",
             )?;
         } else {
             match self.page {
@@ -412,10 +422,10 @@ impl Ui {
         settings: &Settings,
     ) -> Result<()> {
         text(canvas, &fonts.title, 8, 32, 304, TEXT, "Scan setup")?;
-        let gain = settings.gain().to_string();
+        let gain = settings.gain_label();
         for (row, (label, value)) in [
-            ("Profile", settings.label()),
-            ("VGA gain", gain.as_str()),
+            ("Profile", settings.profile_label()),
+            ("Gain", gain.as_str()),
             ("Recording", settings.record_label()),
         ]
         .into_iter()

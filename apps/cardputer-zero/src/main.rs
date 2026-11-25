@@ -15,6 +15,7 @@ use std::time::Duration;
 use ui::{Page, Ui};
 
 struct Options {
+    config: Option<PathBuf>,
     demo: bool,
     duration: Option<Duration>,
     screenshot: Option<PathBuf>,
@@ -23,6 +24,7 @@ struct Options {
 
 fn options() -> Result<Options> {
     let mut result = Options {
+        config: None,
         demo: false,
         duration: None,
         screenshot: None,
@@ -31,6 +33,9 @@ fn options() -> Result<Options> {
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         match arg.as_str() {
+            "--config" => {
+                result.config = Some(args.next().context("--config requires a path")?.into())
+            }
             "--demo" => result.demo = true,
             "--duration" => {
                 result.duration = Some(parse_duration(
@@ -51,7 +56,7 @@ fn options() -> Result<Options> {
                 }
             }
             "--help" | "-h" => {
-                println!("Camfinder for CardputerZero\n\n  --demo                 Scan synthetic signals without an Airspy\n  --duration SECONDS     Exit after this duration\n  --screenshot PATH      Save a 320x170 PNG on exit\n  --page PAGE            scan, detail, config or status\n\n4 Scan  5 Details  6 Setup  7 Status  8 Pause/Resume\nArrows or F/Z/X/C navigate; Enter applies setup; Esc quits.");
+                println!("Camfinder for CardputerZero\n\n  --config PATH          Read and save the shared TOML configuration\n  --demo                 Scan synthetic signals without a receiver\n  --duration SECONDS     Exit after this duration\n  --screenshot PATH      Save a 320x170 PNG on exit\n  --page PAGE            scan, detail, config or status\n\n4 Scan  5 Details  6 Setup  7 Status  8 Pause/Resume\nArrows or F/Z/X/C navigate; Enter applies setup; Esc quits.");
                 std::process::exit(0);
             }
             _ => bail!("unknown option {arg}; use --help"),
@@ -65,7 +70,11 @@ fn options() -> Result<Options> {
 
 fn main() -> Result<()> {
     let options = options()?;
-    let store = SettingsStore::default();
+    let store = options
+        .config
+        .clone()
+        .map(SettingsStore::for_path)
+        .unwrap_or_default();
     let mut settings = store.load()?;
     let mut panel = platform::Panel::open()?;
     if options.screenshot.is_some()
@@ -87,7 +96,8 @@ fn main() -> Result<()> {
     let mut canvas = window.into_canvas().software().build()?;
     let mut events = sdl.event_pump().map_err(anyhow::Error::msg)?;
     let mut ui = Ui::new(options.page);
-    let mut resolved = settings.resolve(&store, options.demo)?;
+    let mut resolved = store.resolve(&settings, options.demo)?;
+    let backend = resolved.engine.device.backend.clone();
     resolved.run.duration = options.duration;
     let mut session = ScanSession::start_with_options(resolved.engine, resolved.run)?;
     let stop = Arc::new(AtomicBool::new(false));
@@ -118,7 +128,7 @@ fn main() -> Result<()> {
                 Keycode::Num7 => ui.page = Page::Status,
                 Keycode::Num8 | Keycode::Space => session.toggle_pause()?,
                 Keycode::Return if ui.page == Page::Config => {
-                    session.save_preferences(&settings, &store, options.demo)?;
+                    session.save_configuration(&settings, &store, options.demo)?;
                     ui.page = Page::Scan;
                 }
                 Keycode::Return => ui.page = Page::Detail,
@@ -156,7 +166,7 @@ fn main() -> Result<()> {
             }
             println!(
                 "{}",
-                serde_json::json!({"backend": if options.demo { "synthetic" } else { "airspy" }, "passes": snapshot.pass, "targets": snapshot.total_targets, "peaks": snapshot.peaks.len(), "candidates": snapshot.persistence.len()})
+                serde_json::json!({"backend": backend, "passes": snapshot.pass, "targets": snapshot.total_targets, "peaks": snapshot.peaks.len(), "candidates": snapshot.persistence.len()})
             );
             break;
         }
