@@ -5,6 +5,7 @@ use anyhow::{anyhow, Result};
 use camfinder::airspy_backend::list_airspy_devices;
 use camfinder::config::{
     AppConfig, Backend, DetectionProfile, OffsetModel, ProfilePreset, RecordMode, ScanRequest,
+    SettingsStore,
 };
 use camfinder::detect::{OffsetEstimate, ProfileDetection};
 use camfinder::engine::{ScanSession, SessionStatus};
@@ -334,7 +335,7 @@ fn main() -> Result<()> {
         command => {
             let config = match cli.config {
                 Some(path) => AppConfig::load(&path)?,
-                None => AppConfig::load_defaults()?,
+                None => SettingsStore::default().load()?,
             };
             match command {
                 Commands::Profiles => print_profiles(&config),
@@ -354,7 +355,7 @@ fn print_profiles(config: &AppConfig) -> Result<()> {
         "profile", "freqs_mhz", "offset", "min_hit", "match_hz"
     );
     for profile in config
-        .profiles
+        .selected_profiles()?
         .iter()
         .flat_map(DetectionProfile::detection_profiles)
     {

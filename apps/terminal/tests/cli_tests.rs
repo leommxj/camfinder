@@ -1,5 +1,14 @@
 use std::process::Command;
 
+fn command() -> Command {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_camfinder"));
+    command.env(
+        "XDG_CONFIG_HOME",
+        std::env::temp_dir().join(format!("camfinder-cli-default-{}", std::process::id())),
+    );
+    command
+}
+
 #[test]
 fn explicit_scans_and_default_config_work_outside_the_repository() {
     let profile = format!(
@@ -29,7 +38,7 @@ fn explicit_scans_and_default_config_work_outside_the_repository() {
             "json",
         ],
     ] {
-        let output = Command::new(env!("CARGO_BIN_EXE_camfinder"))
+        let output = command()
             .current_dir(std::env::temp_dir())
             .args(&args)
             .output()
@@ -47,25 +56,30 @@ fn explicit_scans_and_default_config_work_outside_the_repository() {
 }
 
 #[test]
-fn cli_preset_matches_the_shared_preferences_engine() {
-    use camfinder::config::{PreferenceField, ScanPreferences, SettingsStore};
+fn cli_reads_the_same_saved_toml_as_the_device_application() {
+    use camfinder::config::{AppConfig, PreferenceField, SettingsStore};
     use camfinder::engine::ScanEngine;
     use std::sync::{atomic::AtomicBool, Arc};
-    let mut preferences = ScanPreferences::default();
-    preferences.adjust(PreferenceField::Profile, 2);
-    let store = SettingsStore::in_directories(std::env::temp_dir(), std::env::temp_dir());
-    let resolved = preferences.resolve(&store, true).unwrap();
+    let directory =
+        std::env::temp_dir().join(format!("camfinder-cli-config-{}", std::process::id()));
+    let mut config = AppConfig::default();
+    config.adjust(PreferenceField::Profile, 2);
+    config.device.backend = Some("soapy".into());
+    config.device.soapy.device_args = "driver=airspy".into();
+    config.device.soapy.sample_rate_hz = 3_000_000;
+    let store = SettingsStore::in_directories(directory.clone(), directory.clone());
+    store.save(&config).unwrap();
+    let resolved = store.resolve(&store.load().unwrap(), true).unwrap();
     let expected = ScanEngine::new(resolved.engine)
         .unwrap()
         .scan(&Arc::new(AtomicBool::new(false)), &mut |_| {}, &mut |_| {})
         .unwrap()
         .unwrap();
-    let output = Command::new(env!("CARGO_BIN_EXE_camfinder"))
+    let output = command()
         .current_dir(std::env::temp_dir())
+        .env("XDG_CONFIG_HOME", &directory)
         .args([
             "scan",
-            "--preset",
-            "all",
             "--backend",
             "synthetic",
             "--synthetic-offset",
@@ -98,11 +112,21 @@ fn cli_preset_matches_the_shared_preferences_engine() {
         serde_json::from_slice::<serde_json::Value>(&serde_json::to_vec(&detected).unwrap())
             .unwrap()
     );
+    let shown = command()
+        .env("XDG_CONFIG_HOME", &directory)
+        .arg("show-config")
+        .output()
+        .unwrap();
+    assert!(shown.status.success());
+    let loaded: AppConfig = toml::from_str(std::str::from_utf8(&shown.stdout).unwrap()).unwrap();
+    assert_eq!(loaded.device, config.device);
+    assert_eq!(loaded.preset, config.preset);
+    std::fs::remove_dir_all(directory).unwrap();
 }
 
 #[test]
 fn cli_reports_invalid_duration_without_panicking() {
-    let output = Command::new(env!("CARGO_BIN_EXE_camfinder"))
+    let output = command()
         .args([
             "scan",
             "--preset",
