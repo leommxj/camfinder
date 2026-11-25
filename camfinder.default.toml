@@ -1,6 +1,6 @@
-profile_files = [
-  "profiles",
-]
+preset = "24+27"
+
+# Instead of a preset, load custom profiles with profile_files = ["profile.toml"].
 
 [profile_defaults]
 min_hits = 2
@@ -10,7 +10,9 @@ max_offset_spread_hz = 1200.0
 [scan]
 peak_search_window_hz = 250000.0
 min_peak_snr_db = 4.0
-max_peaks_per_freq = 16
+max_peaks_per_freq = 12
+record = false
+record_mode = "peaks"
 record_spectrum_bins = 128
 record_band_decimation = 1
 output = "tui"
@@ -30,7 +32,9 @@ backend = "airspy"
 [device.airspy]
 device_index = 0
 sample_rate_hz = 3000000
-dwell_ms = 350
+dwell_ms = 300
+fft_frames = 14
+capture_timeout_ms = 3000
 fft_size = 65536
 dc_notch_hz = 2000.0
 settle_ms = 40
@@ -38,9 +42,9 @@ settle_ms = 40
 [device.airspy.gain]
 mode = "manual"
 preset = 18
-lna = 11
-mixer = 9
-vga = 12
+lna = 14
+mixer = 15
+vga = 2
 lna_agc = false
 mixer_agc = false
 

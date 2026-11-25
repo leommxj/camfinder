@@ -30,7 +30,7 @@ settle_ms = 40
 [device.airspy.gain]
 mode = "manual"
 preset = 18
-lna = 15
+lna = 14
 mixer = 15
 vga = 2
 lna_agc = false

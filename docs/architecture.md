@@ -14,34 +14,41 @@ render the returned state. SDL2, Ratatui and Clap are frontend dependencies.
 The default workspace members are the core and terminal application, so root
 `cargo run` launches the terminal application and `cargo test` covers both.
 Use `cargo test --workspace` to include the device application and build tools.
-The terminal application's `airspy` and `soapy` features enable the corresponding
+Both applications' `airspy` and `soapy` features enable the corresponding
 core backends. Core tests stay in `tests/`; CLI integration tests live in
 `apps/terminal/tests/`.
 
 ## Configuration
 
-`config::ScanRequest` accepts configuration edits without depending on a UI
-toolkit. `resolve()` loads an optional config file and resolves defaults,
-selected profile settings, and explicit overrides in that order. It returns
+`AppConfig` defines the TOML schema used by both applications. It includes
+the selected preset or custom profiles, scan settings, device settings and
+masks. Its editing methods change those same fields directly.
+
+`config::ScanRequest` accepts temporary overrides without depending on a UI
+toolkit. `resolve()` loads an explicit file or the shared configuration, then
+applies selected profile settings and explicit overrides. It returns
 an `EngineConfig`, `RunOptions`, and a preferred output format. Incompatible
 scan or device settings across selected profiles return an error.
 
-`ProfilePreset` loads the built-in profiles from the same TOML sources used by
-file-based scans. `target_frequencies()` supplies the deduplicated frequency
-list to both the scan pipeline and session progress reporting.
+`ProfilePreset` loads detection frequencies and thresholds from the existing
+profile TOML sources, leaving receiver and scan settings in `AppConfig`.
+Custom profile files can still include scan/device overrides. Loading them
+merges these into the configuration and expands the profiles inline, so a
+subsequent edit and save preserves the effective settings. Relative paths are
+resolved against the file containing them. `target_frequencies()` supplies the
+deduplicated frequency list to the scan pipeline and progress reporting.
 
-`ScanPreferences` provides the profile, gain and recording choices exposed by
-the small-screen settings page. It applies changes and creates a `ScanRequest`
-through the same resolver. A frontend can offer a different editor without
-implementing validation or profile inheritance itself.
+`SettingsStore` owns paths, TOML loading, validation and atomic replacement.
+Both applications use `$XDG_CONFIG_HOME/camfinder/config.toml`, with `~/.config`
+as the default base, and support an explicit `--config` path. If the default
+file is absent, the core uses the embedded defaults. Configuration is stored
+only as TOML.
 
-`SettingsStore` owns settings paths, JSON loading and atomic replacement.
-Settings use `$XDG_CONFIG_HOME/camfinder/settings.json`, with `~/.config` as the
-default base. If this file is absent, the previous
-`camfinder-cardputer-zero/settings.json` is read. Saving writes the shared path
-and leaves the legacy file intact. New recordings use
+`[scan] record = true` requests a new recording for each session;
+`record_path` optionally selects a fixed file. Automatic paths use
 `$XDG_DATA_HOME/camfinder/recordings`, with `~/.local/share` as the default base.
-CLI config and profile files remain supported through the request resolver.
+The core resolves these paths for both frontends. Capture budgets and default
+gain settings live in `camfinder.default.toml` and are not reapplied at startup.
 
 ## Running scans
 
@@ -74,5 +81,4 @@ tracks candidates or writes scan recordings directly.
 
 The core builds with `cargo check -p camfinder --no-default-features`.
 Core configuration and session tests run without a receiver; CLI integration
-tests compare subprocess output with the engine configured through shared
-preferences.
+tests compare subprocess output with the engine using the same saved TOML.

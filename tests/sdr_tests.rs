@@ -1,5 +1,5 @@
 use anyhow::Result;
-use camfinder::config::{DetectionProfile, OffsetModel, ScanSettings};
+use camfinder::config::{DetectionProfile, OffsetModel, RecordMode, ScanSettings};
 use camfinder::dsp::Complex32;
 use camfinder::sdr::{scan_sdr, scan_sdr_peaks, IqBackend, SdrScanConfig};
 use std::path::PathBuf;
@@ -61,6 +61,7 @@ fn scan(record_path: Option<PathBuf>, record_band_decimation: usize) -> ScanSett
         min_peak_snr_db: 4.0,
         max_peaks_per_freq: 16,
         record_path,
+        record: false,
         record_mode: Default::default(),
         record_spectrum_bins: 128,
         record_band_decimation,
@@ -88,35 +89,35 @@ fn scan_sdr_peaks_tunes_unique_targets_in_order() {
 }
 
 #[test]
-fn scan_sdr_records_spectrum_bands_when_recording_is_enabled() {
-    let mut backend = backend();
-    let scan = scan(Some(PathBuf::from("capture.jsonl")), 2);
-    let mut logs = Vec::new();
-
-    let output = scan_sdr(&mut backend, &[profile()], &scan, &mut |line| {
-        logs.push(line)
-    })
-    .unwrap();
-
-    assert!(output.peaks.is_empty());
-    assert_eq!(output.spectrum_bands.len(), 3);
-    assert!(output
-        .spectrum_bands
-        .iter()
-        .all(|band| band.source.as_deref() == Some("fake")));
-    assert!(output
-        .spectrum_bands
-        .iter()
-        .all(|band| band.point_decimation == 2 && !band.points.is_empty()));
-    assert!(output.spectrum_bands.iter().all(|band| {
-        band.sample_rate_hz == 2_400_000.0
-            && band.fft_size == 1024
-            && band.iq_samples >= 1024
-            && band.fft_frames >= 1
-            && band.dc_notch_hz == 2_000.0
-            && band.min_peak_snr_db == 4.0
-            && band.max_peaks == 16
-    }));
+fn recording_modes_control_spectrum_data_without_losing_capture_statistics() {
+    for mode in [RecordMode::Peaks, RecordMode::Summary, RecordMode::Spectrum] {
+        let mut backend = backend();
+        let mut settings = scan(Some(PathBuf::from("capture.jsonl")), 2);
+        settings.record_mode = mode;
+        let output = scan_sdr(&mut backend, &[profile()], &settings, &mut |_| {}).unwrap();
+        assert!(output.peaks.is_empty(), "{mode:?}");
+        assert_eq!(output.statistics.len(), 3, "{mode:?}");
+        if mode == RecordMode::Peaks {
+            assert!(output.spectrum_bands.is_empty());
+            continue;
+        }
+        assert_eq!(output.spectrum_bands.len(), 3, "{mode:?}");
+        for band in output.spectrum_bands {
+            assert_eq!(band.source.as_deref(), Some("fake"));
+            assert_eq!(band.sample_rate_hz, 2_400_000.0);
+            assert_eq!(band.fft_size, 1024);
+            assert!(band.iq_samples >= 1024 && band.fft_frames >= 1);
+            assert_eq!(band.dc_notch_hz, 2_000.0);
+            assert_eq!(band.min_peak_snr_db, 4.0);
+            assert_eq!(band.max_peaks, 16);
+            if mode == RecordMode::Spectrum {
+                assert_eq!(band.point_decimation, 2);
+                assert!(!band.points.is_empty());
+            } else {
+                assert!(band.points.len() <= 2);
+            }
+        }
+    }
 }
 
 #[test]
@@ -223,25 +224,6 @@ fn stopped_pipeline_does_not_tune() {
         .unwrap();
     assert!(backend.tuned_hz.is_empty());
     assert!(output.statistics.is_empty());
-}
-
-#[test]
-fn capture_summary_and_peak_recording_have_independent_spectrum_costs() {
-    use camfinder::config::RecordMode;
-    let mut backend = backend();
-    let mut settings = scan(Some(PathBuf::from("capture.jsonl")), 1);
-    settings.record_mode = RecordMode::Summary;
-    let summary = scan_sdr(&mut backend, &[profile()], &settings, &mut |_| {}).unwrap();
-    assert_eq!(summary.statistics.len(), 3);
-    assert_eq!(summary.spectrum_bands.len(), 3);
-    assert!(summary
-        .spectrum_bands
-        .iter()
-        .all(|band| band.points.len() <= 2));
-    settings.record_mode = RecordMode::Peaks;
-    let peaks = scan_sdr(&mut backend, &[profile()], &settings, &mut |_| {}).unwrap();
-    assert!(peaks.spectrum_bands.is_empty());
-    assert_eq!(peaks.statistics.len(), 3);
 }
 
 #[test]

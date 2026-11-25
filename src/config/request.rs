@@ -1,4 +1,4 @@
-use super::{AppConfig, DetectionProfile, OffsetModel, ProfilePreset, RecordMode};
+use super::{AppConfig, DetectionProfile, OffsetModel, ProfilePreset, RecordMode, SettingsStore};
 use crate::engine::{EngineConfig, RunOptions};
 use crate::frequency::{parse_frequency_hz, parse_frequency_list_mhz};
 use crate::mask::{parse_mask_spec, MaskSet};
@@ -126,18 +126,20 @@ impl ScanRequest {
     pub fn resolve(&self, path: Option<&Path>) -> Result<ResolvedScan> {
         let config = match path {
             Some(path) => AppConfig::load(path)?,
-            None if self.profile.is_some()
-                || self.profile_freqs.is_some()
-                || self.preset.is_some() =>
-            {
-                toml::from_str(AppConfig::default_toml())?
-            }
-            None => AppConfig::load_defaults()?,
+            None => SettingsStore::default().load()?,
         };
         self.resolve_config(config)
     }
 
-    pub fn resolve_config(&self, mut config: AppConfig) -> Result<ResolvedScan> {
+    pub fn resolve_config(&self, config: AppConfig) -> Result<ResolvedScan> {
+        self.resolve_config_with_store(config, &SettingsStore::default())
+    }
+
+    pub(super) fn resolve_config_with_store(
+        &self,
+        mut config: AppConfig,
+        store: &SettingsStore,
+    ) -> Result<ResolvedScan> {
         ensure!(
             usize::from(self.profile.is_some())
                 + usize::from(self.profile_freqs.is_some())
@@ -164,6 +166,9 @@ impl ScanRequest {
         let profiles = select_profiles(&config, self, match_window)?;
         apply_profile_settings(&mut config, &profiles)?;
         apply_scan_arg_overrides(&mut config, self)?;
+        if config.scan.record && config.scan.record_path.is_none() {
+            config.scan.record_path = Some(store.recording_path()?);
+        }
         let backend = resolve_backend(&config, self)?;
         let device = active_device_settings(&config.device, self, backend)?;
         let masks = collect_masks(&config, self)?.masks().to_vec();
@@ -275,9 +280,7 @@ fn resolve_backend(config: &AppConfig, args: &ScanRequest) -> Result<Backend> {
         .filter(|backend| !backend.is_empty())
         .ok_or_else(|| anyhow!("scan backend is required; set --backend or [device].backend"))?;
 
-    Backend::from_str(backend).map_err(|_| {
-        anyhow!("unknown backend '{backend}', expected synthetic/peaks-file/iq-file/airspy/soapy")
-    })
+    backend.parse()
 }
 
 fn select_profiles(
@@ -306,49 +309,33 @@ fn select_profiles(
         }]);
     }
 
-    if let Some(preset) = args.preset {
-        return Ok(preset
-            .profiles()?
-            .into_iter()
-            .flat_map(|profile| {
-                profile
-                    .with_overrides(
-                        args.min_hits,
-                        args.min_score,
-                        match_window_hz,
-                        args.offset_model,
-                    )
-                    .detection_profiles()
-            })
-            .collect());
-    }
-
     let selected = if let Some(path) = &args.profile {
-        DetectionProfile::load(path)?
+        vec![DetectionProfile::load_with_defaults(
+            path,
+            &config.profile_defaults,
+        )?]
+    } else if let Some(preset) = args.preset {
+        preset.profiles()?
     } else {
-        match config.profiles.as_slice() {
-            [profile] => profile.clone(),
-            [] => {
-                return Err(anyhow!(
-                    "no profile configured; pass --profile <path> or use --profile-freqs"
-                ))
-            }
-            _ => {
-                return Err(anyhow!(
-                    "scan requires a single profile; pass --profile <path> or configure one profile file"
-                ))
-            }
-        }
+        config.selected_profiles()?
     };
-
+    ensure!(
+        !selected.is_empty(),
+        "no profile configured; select a preset or a profile file"
+    );
     Ok(selected
-        .with_overrides(
-            args.min_hits,
-            args.min_score,
-            match_window_hz,
-            args.offset_model,
-        )
-        .detection_profiles())
+        .into_iter()
+        .flat_map(|profile| {
+            profile
+                .with_overrides(
+                    args.min_hits,
+                    args.min_score,
+                    match_window_hz,
+                    args.offset_model,
+                )
+                .detection_profiles()
+        })
+        .collect())
 }
 
 fn apply_scan_arg_overrides(config: &mut AppConfig, args: &ScanRequest) -> Result<()> {

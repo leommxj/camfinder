@@ -12,9 +12,9 @@ use std::sync::{mpsc, Arc};
 use std::thread;
 use std::time::{Duration, Instant};
 
-#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct DeviceSettings {
-    #[serde(default)]
+    #[serde(default = "default_backend")]
     pub backend: Option<String>,
     #[serde(default)]
     pub peaks_file: PeaksFileSettings,
@@ -24,6 +24,12 @@ pub struct DeviceSettings {
     pub soapy: SoapySettings,
     #[serde(default)]
     pub replay: ReplaySettings,
+}
+
+impl Default for DeviceSettings {
+    fn default() -> Self {
+        default_device_settings()
+    }
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -593,6 +599,10 @@ fn validate_capture_budget(
 
 fn default_capture_timeout_ms() -> u64 {
     3000
+}
+
+fn default_backend() -> Option<String> {
+    default_device_settings().backend
 }
 
 fn default_airspy_sample_rate() -> u32 {

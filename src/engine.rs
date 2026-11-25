@@ -1,5 +1,5 @@
 use crate::config::{
-    target_frequencies, DetectionProfile, RecordMode, ResolvedScan, ScanPreferences, ScanSettings,
+    target_frequencies, AppConfig, DetectionProfile, RecordMode, ResolvedScan, ScanSettings,
     SettingsStore,
 };
 use crate::detect::{detect_profile_candidates, ProfileDetection};
@@ -474,15 +474,15 @@ impl ScanSession {
         self.restart(resolved.engine, resolved.run)
     }
 
-    pub fn save_preferences(
+    pub fn save_configuration(
         &mut self,
-        preferences: &ScanPreferences,
+        config: &AppConfig,
         store: &SettingsStore,
         demo: bool,
     ) -> Result<()> {
-        let mut resolved = preferences.resolve(store, demo)?;
+        let mut resolved = store.resolve(config, demo)?;
         resolved.run.duration = self.options.duration;
-        store.save(preferences)?;
+        store.save(config)?;
         self.apply(resolved)
     }
 

@@ -48,47 +48,28 @@ fn peak(id: usize, freq_hz: f64, power_db: f64, floor_db: f64) -> Peak {
 }
 
 #[test]
-fn detects_dynamic_fixed_offset_for_partial_profile() {
-    let profile = fixed_profile(2);
-    let peaks = vec![
-        peak(1, 816_012_500.0, -70.0, -85.0),
-        peak(2, 840_012_700.0, -69.0, -85.0),
-        peak(3, 864_012_300.0, -72.0, -85.0),
-    ];
-
-    let detection = detect_profile(
-        &profile,
-        &peaks,
-        &MaskSet::default(),
-        &ScanSettings::default(),
-    );
-
-    assert!(detection.detected);
-    assert_eq!(detection.hits, 3);
-}
-
-#[test]
-fn refines_fixed_offset_from_all_hits() {
-    let profile = fixed_profile(3);
+fn detects_and_refines_fixed_offsets_with_partial_or_complete_hits() {
     let peaks = vec![
         peak(1, 816_012_000.0, -70.0, -85.0),
         peak(2, 840_012_500.0, -70.0, -85.0),
         peak(3, 864_013_000.0, -70.0, -85.0),
     ];
 
-    let detection = detect_profile(
-        &profile,
-        &peaks,
-        &MaskSet::default(),
-        &ScanSettings::default(),
-    );
-
-    assert!(detection.detected);
-    assert!(matches!(
-        detection.offset,
-        Some(OffsetEstimate::FixedHz { hz }) if (hz - 12_500.0).abs() < 1.0
-    ));
-    assert!((detection.offset_group_hz.unwrap() - 12_500.0).abs() < 1.0);
+    for (hits, expected_offset) in [(2, 12_250.0), (3, 12_500.0)] {
+        let detection = detect_profile(
+            &fixed_profile(hits),
+            &peaks[..hits],
+            &MaskSet::default(),
+            &ScanSettings::default(),
+        );
+        assert!(detection.detected, "hits={hits}");
+        assert_eq!(detection.hits, hits);
+        assert!(matches!(
+            detection.offset,
+            Some(OffsetEstimate::FixedHz { hz }) if (hz - expected_offset).abs() < 1.0
+        ));
+        assert!((detection.offset_group_hz.unwrap() - expected_offset).abs() < 1.0);
+    }
 }
 
 #[test]

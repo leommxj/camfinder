@@ -28,6 +28,10 @@ fn observed_single_pass_matches_the_synchronous_engine() {
         serde_json::to_value(&expected.results).unwrap(),
         serde_json::to_value(&pass.results).unwrap()
     );
+    assert_eq!(
+        serde_json::to_value(&session.snapshot().results).unwrap(),
+        serde_json::to_value(&expected.results).unwrap()
+    );
     assert_eq!(session.snapshot().pass, 1);
     assert!(passes.try_recv().is_err());
     session.stop().unwrap();
@@ -128,21 +132,14 @@ fn wait_for(session: &ScanSession, predicate: impl Fn(&camfinder::engine::ScanSn
 }
 
 #[test]
-fn session_and_synchronous_engine_share_results_and_tracking() {
-    let mut engine = ScanEngine::new(config()).unwrap();
-    let stop = Arc::new(AtomicBool::new(false));
-    let first = engine
-        .scan(&stop, &mut |_| {}, &mut |_| {})
-        .unwrap()
-        .unwrap();
-    assert!(first.results.iter().any(|result| result.detected));
+fn session_pauses_resumes_and_stops() {
     let mut session = ScanSession::start(config()).unwrap();
     wait_for(&session, |snapshot| snapshot.pass > 0);
-    let snapshot = session.snapshot();
-    assert_eq!(
-        serde_json::to_value(&snapshot.results).unwrap(),
-        serde_json::to_value(&first.results).unwrap()
-    );
+    assert!(session
+        .snapshot()
+        .results
+        .iter()
+        .any(|result| result.detected));
     session.command(SessionCommand::Pause);
     wait_for(&session, |snapshot| {
         snapshot.status == SessionStatus::Paused

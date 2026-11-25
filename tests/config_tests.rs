@@ -1,33 +1,21 @@
-use camfinder::config::{AppConfig, DetectionProfile, OffsetModel};
-use std::path::Path;
+use camfinder::config::{
+    target_frequencies, AppConfig, DetectionProfile, OffsetModel, ProfilePreset,
+};
 
 #[test]
-fn embedded_default_config_parses() {
+fn embedded_defaults_match_partial_profiles() {
     let config = AppConfig::default();
-    assert!(config
-        .profile_files
-        .iter()
-        .any(|path| path == Path::new("profiles")));
-    assert!(config
-        .profiles
-        .iter()
-        .any(|profile| profile.name == "best_high_airspy"));
-    assert!(config
-        .profiles
-        .iter()
-        .any(|profile| profile.name == "25mhz_high_airspy"));
-    assert!(config
-        .profiles
-        .iter()
-        .any(|profile| profile.name == "wide_24_27_216_972_airspy"));
+    assert_eq!(config.preset, Some(ProfilePreset::High24And27));
+    assert!(config.profile_files.is_empty());
+    assert_eq!(
+        target_frequencies(&config.selected_profiles().unwrap()).len(),
+        7
+    );
     assert_eq!(config.device.backend.as_deref(), Some("airspy"));
-    assert_eq!(config.device.airspy.dwell_ms, 350);
+    assert_eq!(config.device.airspy.dwell_ms, 300);
+    assert_eq!(config.device.airspy.fft_frames, Some(14));
     assert_eq!(config.device.airspy.settle_ms, 40);
     assert_eq!(config.device.soapy.sample_rate_hz, 2_400_000);
-}
-
-#[test]
-fn profile_field_defaults_come_from_toml() {
     let profile: DetectionProfile = toml::from_str(
         r#"
         name = "minimal"
@@ -36,9 +24,12 @@ fn profile_field_defaults_come_from_toml() {
     )
     .unwrap();
 
-    assert_eq!(profile.min_hits, 2);
-    assert_eq!(profile.min_score, 8.0);
-    assert_eq!(profile.max_offset_spread_hz, 1_200.0);
+    assert_eq!(profile.min_hits, config.profile_defaults.min_hits);
+    assert_eq!(profile.min_score, config.profile_defaults.min_score);
+    assert_eq!(
+        profile.max_offset_spread_hz,
+        config.profile_defaults.max_offset_spread_hz
+    );
 }
 
 #[test]
