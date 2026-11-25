@@ -5,12 +5,6 @@
   "store": {
     "summary": "Experimental SDR-assisted camera leakage detector.",
     "description": "Experimental SDR-assisted camera leakage detection for Cardputer Zero. Scans for weak electromagnetic leakage near crystal-clock harmonics, fits a shared offset model, and tracks persistent candidates. Practical detection relies heavily on an external low-noise amplifier (LNA): the original experiments used a 20 dB external LNA, and neither an Airspy Mini nor a USRP B210 captured the leakage effectively without one. The default package includes the Airspy backend; optional builds support SoapySDR.",
-    "locales": {
-      "zh-CN": {
-        "summary": "实验性的 SDR 辅助摄像头电磁泄漏检测工具。",
-        "description": "在 Cardputer Zero 上检测摄像头晶振时钟谐波附近的微弱电磁泄漏，通过扫描频点、寻找窄峰和拟合共同频偏模型，持续跟踪候选信号。实际检测效果非常依赖外置低噪声放大器（LNA）：原项目实测使用了 20 dB 外置 LNA，单独使用 Airspy Mini 或 USRP B210 均无法有效捕获泄漏信号。默认安装包内置 Airspy 后端，可选编译支持 SoapySDR。"
-      }
-    },
     "icon": "assets/icon.png",
     "screenshots": ["assets/screenshot.png"],
     "categories": ["Radio & Comms", "Hardware & IoT"],
