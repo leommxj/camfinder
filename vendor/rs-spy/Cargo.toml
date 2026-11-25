@@ -1,6 +1,6 @@
 [package]
 name = "rs-spy"
-version = "0.4.1"
+version = "0.5.2"
 authors = ["Xavier Olive <git@xoolive.org>"]
 edition = "2024"
 license = "MIT"

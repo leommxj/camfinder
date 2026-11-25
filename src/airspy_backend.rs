@@ -6,7 +6,7 @@ use crate::sdr::{
     SdrScanConfig,
 };
 use anyhow::{anyhow, Context, Result};
-use rs_spy::{Airspy, IqConverter, RECOMMENDED_BUFFER_SIZE};
+use rs_spy::{transport::TryRecv, Airspy, IqConverter, RECOMMENDED_BUFFER_SIZE};
 use std::sync::{
     atomic::{AtomicBool, Ordering},
     Arc,
@@ -218,12 +218,18 @@ fn collect_iq(
                     statistics.raw_bytes
                 ));
             }
-            let Some(raw) = reader.recv_timeout(Duration::from_millis(20))? else {
-                if last_data.elapsed() >= Duration::from_millis(250) {
-                    statistics.timeouts += 1;
-                    return Err(anyhow!("Airspy USB receive timed out"));
+            let raw = match reader.recv_timeout(Duration::from_millis(20))? {
+                TryRecv::Item(raw) => raw,
+                TryRecv::Empty => {
+                    if last_data.elapsed() >= Duration::from_millis(250) {
+                        statistics.timeouts += 1;
+                        return Err(anyhow!("Airspy USB receive timed out"));
+                    }
+                    continue;
                 }
-                continue;
+                TryRecv::End => {
+                    return Err(anyhow!("Airspy stream ended before capture completed"))
+                }
             };
             last_data = Instant::now();
             statistics.raw_bytes += raw.len() as u64;

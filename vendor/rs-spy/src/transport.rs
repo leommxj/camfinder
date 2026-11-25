@@ -73,6 +73,21 @@ pub const SAMPLES_PER_BUFFER: usize = RECOMMENDED_BUFFER_SIZE / 2;
 
 pub const DEFAULT_ASYNC_QUEUE_LEN: usize = 16;
 
+/// Gain constraints declared by the Airspy C driver and hardware protocol.
+///
+/// These are not queried from the device at runtime.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AirspyDeclaredGainCapabilities {
+    /// LNA range as `(minimum, maximum, step)` in hardware gain units.
+    pub lna: (u8, u8, u8),
+    /// Mixer range as `(minimum, maximum, step)` in hardware gain units.
+    pub mixer: (u8, u8, u8),
+    /// VGA range as `(minimum, maximum, step)` in hardware gain units.
+    pub vga: (u8, u8, u8),
+    /// Sensitivity and linearity preset range as `(minimum, maximum, step)`.
+    pub preset: (u8, u8, u8),
+}
+
 /// Raw gain stage values sent over the async control channel.
 ///
 /// The dB-to-preset mapping lives in the caller (e.g. `desperado`); here we
@@ -86,12 +101,23 @@ pub struct AirspyGainStages {
     pub vga: u8,   // 0-15
 }
 
+/// Result of a non-blocking or timed receive attempt.
+#[derive(Debug, PartialEq, Eq)]
+pub enum TryRecv<T> {
+    /// A sample chunk is available.
+    Item(T),
+    /// The reader is still active but no chunk is available yet.
+    Empty,
+    /// The reader stopped cleanly.
+    End,
+}
+
 pub struct AsyncReadHandle {
-    rx: mpsc::Receiver<Result<Vec<u8>>>,
+    rx: Option<mpsc::Receiver<Result<Vec<u8>>>>,
     ctrl_tx: mpsc::Sender<AsyncReadControl>,
     stop: Arc<AtomicBool>,
     dropped: Arc<AtomicU64>,
-    thread: Option<thread::JoinHandle<(Airspy, Result<()>)>>,
+    thread: Option<thread::JoinHandle<Result<Airspy>>>,
 }
 
 #[derive(Clone)]
@@ -107,30 +133,68 @@ enum AsyncReadControl {
 }
 
 impl AsyncReadHandle {
-    pub fn recv(&self) -> Option<Result<Vec<u8>>> {
-        self.rx.recv().ok()
-    }
-
-    pub fn recv_timeout(&self, timeout: Duration) -> Result<Option<Vec<u8>>> {
-        match self.rx.recv_timeout(timeout) {
-            Ok(result) => result.map(Some),
-            Err(mpsc::RecvTimeoutError::Timeout) => Ok(None),
-            Err(mpsc::RecvTimeoutError::Disconnected) => {
-                Err(Error::StreamingError("async reader stopped".into()))
-            }
+    /// Receive the next chunk of raw data (blocking).
+    ///
+    /// Returns `Ok(None)` after an intentional stop. An unexpected reader
+    /// termination, including a device disconnect, is returned as `Err`.
+    pub fn recv(&self) -> Result<Option<Vec<u8>>> {
+        let Some(rx) = &self.rx else {
+            return Ok(None);
+        };
+        match rx.recv() {
+            Ok(Ok(bytes)) => Ok(Some(bytes)),
+            Ok(Err(error)) => Err(error),
+            Err(_) if self.stop.load(Ordering::Relaxed) => Ok(None),
+            Err(_) => Err(Error::StreamingError(
+                "streaming thread ended unexpectedly".to_string(),
+            )),
         }
     }
 
+    /// Try to receive the next chunk without blocking.
+    pub fn try_recv(&self) -> Result<TryRecv<Vec<u8>>> {
+        let Some(rx) = &self.rx else {
+            return Ok(TryRecv::End);
+        };
+        match rx.try_recv() {
+            Ok(Ok(bytes)) => Ok(TryRecv::Item(bytes)),
+            Ok(Err(error)) => Err(error),
+            Err(mpsc::TryRecvError::Empty) => Ok(TryRecv::Empty),
+            Err(mpsc::TryRecvError::Disconnected) if self.stop.load(Ordering::Relaxed) => {
+                Ok(TryRecv::End)
+            }
+            Err(mpsc::TryRecvError::Disconnected) => Err(Error::StreamingError(
+                "streaming thread ended unexpectedly".to_string(),
+            )),
+        }
+    }
+
+    /// Wait up to `timeout`, distinguishing a timeout from a clean stream end.
+    pub fn recv_timeout(&self, timeout: Duration) -> Result<TryRecv<Vec<u8>>> {
+        let Some(rx) = &self.rx else {
+            return Ok(TryRecv::End);
+        };
+        match rx.recv_timeout(timeout) {
+            Ok(result) => result.map(TryRecv::Item),
+            Err(mpsc::RecvTimeoutError::Timeout) => Ok(TryRecv::Empty),
+            Err(mpsc::RecvTimeoutError::Disconnected) if self.stop.load(Ordering::Relaxed) => {
+                Ok(TryRecv::End)
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => Err(Error::StreamingError(
+                "streaming thread ended unexpectedly".to_string(),
+            )),
+        }
+    }
+
+    /// Stop RX and drain USB transfers, returning the device or the worker error.
     pub fn stop_and_reclaim(mut self) -> Result<Airspy> {
         self.stop.store(true, Ordering::Relaxed);
-        let (device, result) = self
-            .thread
+        self.rx.take();
+        self.thread
             .take()
             .unwrap()
             .join()
-            .map_err(|_| Error::StreamingError("async reader panicked".into()))?;
-        result?;
-        Ok(device)
+            .map_err(|_| Error::StreamingError("async reader panicked".into()))?
     }
 
     pub fn control_handle(&self) -> AsyncReadControlHandle {
@@ -145,6 +209,8 @@ impl AsyncReadHandle {
 impl Drop for AsyncReadHandle {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::Relaxed);
+        // Unblock a producer waiting on a full sample queue before joining.
+        self.rx.take();
         if let Some(handle) = self.thread.take() {
             let _ = handle.join();
         }
@@ -574,13 +640,50 @@ impl Airspy {
         Ok(())
     }
 
+    /// Return gain constraints declared by the Airspy C driver and protocol.
+    pub fn declared_gain_capabilities() -> AirspyDeclaredGainCapabilities {
+        AirspyDeclaredGainCapabilities {
+            lna: (0, 14, 1),
+            mixer: (0, 15, 1),
+            vga: (0, 15, 1),
+            preset: (0, (GAIN_COUNT - 1) as u8, 1),
+        }
+    }
+
+    /// Normalize an LNA gain request to a supported hardware value.
+    pub fn normalize_lna_gain(gain: u8) -> u8 {
+        let applied = gain.min(14);
+        if applied != gain {
+            tracing::warn!(requested = gain, applied, "Airspy LNA gain was clamped");
+        }
+        applied
+    }
+
+    /// Normalize a mixer gain request to a supported hardware value.
+    pub fn normalize_mixer_gain(gain: u8) -> u8 {
+        let applied = gain.min(15);
+        if applied != gain {
+            tracing::warn!(requested = gain, applied, "Airspy mixer gain was clamped");
+        }
+        applied
+    }
+
+    /// Normalize a VGA gain request to a supported hardware value.
+    pub fn normalize_vga_gain(gain: u8) -> u8 {
+        let applied = gain.min(15);
+        if applied != gain {
+            tracing::warn!(requested = gain, applied, "Airspy VGA gain was clamped");
+        }
+        applied
+    }
+
     /// Set the LNA (Low Noise Amplifier) gain.
     ///
     /// # Arguments
     ///
-    /// * `gain` - Gain value 0-14 (clamped if out of range)
+    /// * `gain` - Gain value 0-14; higher values are clamped with a warning.
     pub fn set_lna_gain(&self, gain: u8) -> Result<()> {
-        let gain = gain.min(14);
+        let gain = Self::normalize_lna_gain(gain);
         let data = self.control_in(AirspyCommand::SetLnaGain.as_u8(), 0, gain as u16, 1)?;
 
         if data.is_empty() {
@@ -597,9 +700,9 @@ impl Airspy {
     ///
     /// # Arguments
     ///
-    /// * `gain` - Gain value 0-15 (clamped if out of range)
+    /// * `gain` - Gain value 0-15; higher values are clamped with a warning.
     pub fn set_mixer_gain(&self, gain: u8) -> Result<()> {
-        let gain = gain.min(15);
+        let gain = Self::normalize_mixer_gain(gain);
         let data = self.control_in(AirspyCommand::SetMixerGain.as_u8(), 0, gain as u16, 1)?;
 
         if data.is_empty() {
@@ -616,9 +719,9 @@ impl Airspy {
     ///
     /// # Arguments
     ///
-    /// * `gain` - Gain value 0-15 (clamped if out of range)
+    /// * `gain` - Gain value 0-15; higher values are clamped with a warning.
     pub fn set_vga_gain(&self, gain: u8) -> Result<()> {
-        let gain = gain.min(15);
+        let gain = Self::normalize_vga_gain(gain);
         let data = self.control_in(AirspyCommand::SetVgaGain.as_u8(), 0, gain as u16, 1)?;
 
         if data.is_empty() {
@@ -902,18 +1005,21 @@ impl Airspy {
             let result = streaming_thread(
                 &self,
                 iface,
-                tx,
+                &tx,
                 stop_thread,
                 dropped_thread,
                 ctrl_rx,
                 buf_len,
                 buf_num,
             );
-            (self, result)
+            if let Err(error) = &result {
+                let _ = tx.try_send(Err(Error::StreamingError(error.to_string())));
+            }
+            result.map(|()| self)
         });
 
         Ok(AsyncReadHandle {
-            rx,
+            rx: Some(rx),
             ctrl_tx,
             stop,
             dropped,
@@ -1024,7 +1130,7 @@ fn queue_chunk(
 fn streaming_thread(
     dev: &Airspy,
     iface: nusb::Interface,
-    tx: mpsc::SyncSender<Result<Vec<u8>>>,
+    tx: &mpsc::SyncSender<Result<Vec<u8>>>,
     stop: Arc<AtomicBool>,
     dropped: Arc<AtomicU64>,
     ctrl_rx: mpsc::Receiver<AsyncReadControl>,
@@ -1066,7 +1172,7 @@ fn streaming_thread(
             if data.is_empty() {
                 continue;
             }
-            if !queue_chunk(&tx, data, &stop, &dropped)? {
+            if !queue_chunk(tx, data, &stop, &dropped)? {
                 break;
             }
         }
@@ -1103,8 +1209,116 @@ fn apply_gain_stages(dev: &Airspy, stages: AirspyGainStages) -> Result<()> {
 }
 
 #[cfg(test)]
-mod tests {
+mod reader_tests {
     use super::*;
+
+    #[test]
+    fn stopping_unblocks_a_full_queue_and_reclaim_propagates_worker_errors() {
+        for reclaim in [false, true] {
+            let (mut handle, tx) = handle();
+            tx.send(Ok(vec![1])).unwrap();
+            tx.send(Ok(vec![2])).unwrap();
+            let (entered_tx, entered_rx) = mpsc::channel();
+            handle.thread = Some(std::thread::spawn(move || {
+                entered_tx.send(()).unwrap();
+                assert!(tx.send(Ok(vec![3])).is_err());
+                Err(Error::Timeout)
+            }));
+            entered_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+            let (done_tx, done_rx) = mpsc::channel();
+            let stopper = std::thread::spawn(move || {
+                if reclaim {
+                    assert!(matches!(handle.stop_and_reclaim(), Err(Error::Timeout)));
+                } else {
+                    drop(handle);
+                }
+                done_tx.send(()).unwrap();
+            });
+            done_rx
+                .recv_timeout(Duration::from_secs(1))
+                .expect("stopping the reader must wake and join a blocked producer");
+            stopper.join().unwrap();
+        }
+    }
+
+    fn handle() -> (AsyncReadHandle, mpsc::SyncSender<Result<Vec<u8>>>) {
+        let (tx, rx) = mpsc::sync_channel(2);
+        let (ctrl_tx, _ctrl_rx) = mpsc::channel();
+        let handle = AsyncReadHandle {
+            rx: Some(rx),
+            ctrl_tx,
+            stop: Arc::new(AtomicBool::new(false)),
+            dropped: Arc::new(AtomicU64::new(0)),
+            thread: None,
+        };
+        (handle, tx)
+    }
+
+    #[test]
+    fn recv_distinguishes_data_error_and_clean_end() {
+        let (handle, tx) = handle();
+        tx.send(Ok(vec![1, 2])).unwrap();
+        assert_eq!(handle.recv().unwrap(), Some(vec![1, 2]));
+
+        tx.send(Err(Error::StreamingError("unplugged".into())))
+            .unwrap();
+        assert!(
+            matches!(handle.recv(), Err(Error::StreamingError(message)) if message == "unplugged")
+        );
+
+        handle.stop.store(true, Ordering::Relaxed);
+        drop(tx);
+        assert_eq!(handle.recv().unwrap(), None);
+    }
+
+    #[test]
+    fn recv_rejects_unexpected_channel_close() {
+        let (handle, tx) = handle();
+        drop(tx);
+        assert!(
+            matches!(handle.recv(), Err(Error::StreamingError(message)) if message.contains("ended unexpectedly"))
+        );
+    }
+
+    #[test]
+    fn try_recv_distinguishes_empty_and_end() {
+        let (handle, tx) = handle();
+        assert!(matches!(handle.try_recv().unwrap(), TryRecv::Empty));
+        handle.stop.store(true, Ordering::Relaxed);
+        drop(tx);
+        assert!(matches!(handle.try_recv().unwrap(), TryRecv::End));
+    }
+
+    #[test]
+    fn timed_receive_distinguishes_timeout_data_error_and_end() {
+        let (handle, tx) = handle();
+        let timeout = Duration::from_millis(1);
+        assert_eq!(handle.recv_timeout(timeout).unwrap(), TryRecv::Empty);
+        tx.send(Ok(vec![1, 2])).unwrap();
+        assert_eq!(
+            handle.recv_timeout(timeout).unwrap(),
+            TryRecv::Item(vec![1, 2])
+        );
+        tx.send(Err(Error::Timeout)).unwrap();
+        assert!(matches!(handle.recv_timeout(timeout), Err(Error::Timeout)));
+        drop(tx);
+        assert!(matches!(
+            handle.recv_timeout(timeout),
+            Err(Error::StreamingError(_))
+        ));
+        handle.control_handle().stop();
+        assert_eq!(handle.recv_timeout(timeout).unwrap(), TryRecv::End);
+    }
+
+    #[test]
+    fn declared_gain_constraints_match_airspy_protocol() {
+        let capabilities = Airspy::declared_gain_capabilities();
+        assert_eq!(capabilities.lna, (0, 14, 1));
+        assert_eq!(capabilities.mixer, (0, 15, 1));
+        assert_eq!(capabilities.vga, (0, 15, 1));
+        assert_eq!(capabilities.preset, (0, 21, 1));
+        assert_eq!(Airspy::normalize_lna_gain(255), 14);
+    }
 
     #[test]
     fn full_receive_queue_is_reported_instead_of_blocking_or_losing_samples() {
